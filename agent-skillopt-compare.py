@@ -1,0 +1,1144 @@
+import argparse
+import json
+import os
+import re
+import sys
+import uuid
+
+import yaml
+from deepagents import create_deep_agent
+from dotenv import load_dotenv
+
+# Custom filesystem backend and middleware with mode support
+from backends import FilesystemBackendWithMode
+from middleware import patch_filesystem_middleware
+from patches import patch_reasoning_content
+
+# Apply patch to FilesystemMiddleware to add mode parameter support
+patch_filesystem_middleware()
+# Preserve reasoning_content round-trip for thinking models (Kimi K2.5, etc.)
+patch_reasoning_content()
+from sqlalchemy.engine import URL as _SAUrl
+from langchain_core.language_models import BaseChatModel
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI
+from langchain_community.agent_toolkits import SQLDatabaseToolkit
+from langchain_community.utilities import SQLDatabase
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.types import Overwrite
+from rich.console import Console
+from rich.markup import escape as rich_escape
+from rich.panel import Panel
+from rich.prompt import Prompt
+
+from tools import (
+    DEFAULT_MAX_RESULT_CHARS,
+    create_custom_list_tables_tool,
+    create_custom_schema_tool,
+    EntityRetrievalEngine,
+    LargeResultStore,
+    create_sql_query_tool,
+)
+from prompts import apply_prompts, apply_to_sql_tools, _PROMPT_LOCK
+
+# Load environment variables
+load_dotenv()
+
+# Default: apply Chinese prompts at startup (for CLI usage)
+apply_prompts("zh")
+
+console = Console()
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TOPICS_DIR = os.path.join(BASE_DIR, "topics")
+TEMPLATE_PATHS = {
+    "zh": os.path.join(BASE_DIR, "SYSTEM_TEMPLATE.md"),
+    "en": os.path.join(BASE_DIR, "SYSTEM_TEMPLATE_en.md"),
+}
+MODEL_CONFIG_PATH = os.path.join(BASE_DIR, "model_config.yaml")
+DEFAULT_TOPIC = "gzns"
+
+
+# ── Model config ─────────────────────────────────────────────────────────────
+
+_ENV_VAR_PATTERN = re.compile(r'\$\{(\w+)\}')
+
+
+def _resolve_env_vars(value):
+    """递归解析配置值中的 ${ENV_VAR} 环境变量引用。
+
+    支持:
+      - "${VAR}"        → 整个值替换为环境变量值
+      - "prefix_${VAR}" → 字符串内嵌替换
+      - dict / list     → 递归处理
+    如果环境变量未设置，保留原始 ${VAR} 字符串并打印警告。
+    """
+    if isinstance(value, str):
+        def _replace(match):
+            env_var = match.group(1)
+            env_val = os.environ.get(env_var)
+            if env_val is None:
+                console.print(f"[bold yellow]Warning:[/bold yellow] Environment variable '{env_var}' is not set, keeping '${{{env_var}}}'")
+                return match.group(0)
+            return env_val
+        return _ENV_VAR_PATTERN.sub(_replace, value)
+    elif isinstance(value, dict):
+        return {k: _resolve_env_vars(v) for k, v in value.items()}
+    elif isinstance(value, list):
+        return [_resolve_env_vars(item) for item in value]
+    return value
+
+
+def load_model_config() -> dict:
+    """Load model_config.yaml and return the parsed dict (env vars resolved)."""
+    if not os.path.isfile(MODEL_CONFIG_PATH):
+        return {}
+    with open(MODEL_CONFIG_PATH, "r", encoding="utf-8") as f:
+        config = yaml.safe_load(f) or {}
+    return _resolve_env_vars(config)
+
+
+def create_model_from_config(model_name: str, config: dict | None = None) -> BaseChatModel:
+    """Create a chat model instance from model_config.yaml by model name.
+
+    Supports multiple providers via the ``provider`` field:
+      - ``openai`` (default): creates ``ChatOpenAI``
+      - ``google_genai``: creates ``ChatGoogleGenerativeAI`` (native Gemini SDK,
+        required for Gemini 3.x models that use thought signatures)
+      - ``openai_proxy``: creates ``ChatOpenAIProxy`` (lazy import,
+        requires ``openai-proxy`` package installed separately)
+    """
+    if config is None:
+        config = load_model_config()
+
+    models = config.get("models", {})
+    if model_name not in models:
+        available = ", ".join(models.keys()) or "(none)"
+        console.print(f"[bold red]Error:[/bold red] Model '{model_name}' not found in model_config.yaml. Available: {available}")
+        sys.exit(1)
+
+    cfg = models[model_name]
+    provider = cfg.get("provider", "openai").lower()
+
+    if provider == "google_genai":
+        kwargs: dict = {}
+        kwargs["model"] = cfg.get("model_name", model_name)
+        if cfg.get("api_key"):
+            kwargs["google_api_key"] = cfg["api_key"]
+        if cfg.get("temperature") is not None:
+            kwargs["temperature"] = cfg["temperature"]
+        if cfg.get("max_tokens") is not None:
+            kwargs["max_output_tokens"] = cfg["max_tokens"]
+        if cfg.get("top_p") is not None:
+            kwargs["top_p"] = cfg["top_p"]
+        if cfg.get("thinking") is not None:
+            kwargs["thinking"] = cfg["thinking"]
+        return ChatGoogleGenerativeAI(**kwargs)
+
+    if provider == "openai_proxy":
+        from chat_openai_proxy import ChatOpenAIProxy
+        return ChatOpenAIProxy(
+            api_key=cfg.get("api_key", ""),
+            model_name=cfg.get("model_name", model_name),
+            channel_code=cfg.get("channel_code", "ali"),
+            transaction_id_prefix=cfg.get("transaction_id_prefix", "text2sql"),
+            enable_thinking=cfg.get("enable_thinking", False),
+        )
+
+    # Default: OpenAI-compatible provider. ``max_input_tokens`` describes the
+    # model's context capacity for local bookkeeping; it is not an accepted
+    # Chat Completions request parameter. Passing it through ``model_kwargs``
+    # makes the OpenAI client reject every request before it reaches the model.
+    local_metadata_keys = {"model_name", "provider", "max_input_tokens"}
+    kwargs = {k: v for k, v in cfg.items() if k not in local_metadata_keys}
+    kwargs["model"] = cfg.get("model_name", model_name)
+    return ChatOpenAI(**kwargs)
+
+
+# ── Topic auto-discovery ─────────────────────────────────────────────────────
+
+def discover_topics() -> dict[str, dict]:
+    """Auto-discover topics by scanning topics/ for subdirectories with config.yaml."""
+    topics: dict[str, dict] = {}
+    if not os.path.isdir(TOPICS_DIR):
+        return topics
+
+    for name in sorted(os.listdir(TOPICS_DIR)):
+        topic_dir = os.path.join(TOPICS_DIR, name)
+        config_path = os.path.join(topic_dir, "config.yaml")
+        if os.path.isdir(topic_dir) and os.path.isfile(config_path):
+            with open(config_path, "r", encoding="utf-8") as f:
+                config = yaml.safe_load(f) or {}
+            topics[name] = {
+                "dir": topic_dir,
+                "config": config,
+                "description": config.get("description", ""),
+            }
+    return topics
+
+
+# ── SYSTEM.md generation ─────────────────────────────────────────────────────
+
+def _generate_database_info(
+    config: dict, topic_dir: str,
+    allowed_models: "set[str] | None" = None,
+) -> str:
+    """Generate the Database Information section from config + database.json.
+
+    Parameters
+    ----------
+    allowed_models : set[str] | None
+        If not None, only tables in this set are listed in the Core Tables
+        section. None means no filtering (admin / no permission config).
+    """
+    lines: list[str] = []
+    lines.append(f"- **Database type:** {config.get('db_type', 'SQLite')}")
+    lines.append(f"- **Topic:** {config.get('topic_name', '')}")
+    lines.append(f"- **Contains:** {config.get('description', '')}")
+
+    # If database.json exists, generate Core Tables list
+    db_json_path = os.path.join(topic_dir, "database.json")
+    if os.path.isfile(db_json_path):
+        with open(db_json_path, "r", encoding="utf-8") as f:
+            db_json = json.load(f)
+        tables: list[tuple[str, str]] = []
+        for db in db_json.get("databases", []):
+            for tbl in db.get("tables", []):
+                tname = tbl["table_name"]
+                if allowed_models is not None and tname not in allowed_models:
+                    continue
+                tables.append((tname, tbl.get("table_comment", "")))
+        if tables:
+            lines.append("")
+            lines.append("### Core Tables")
+            lines.append("")
+            lines.append("| Table | Description |")
+            lines.append("|-------|-------------|")
+            for tname, tcomment in tables:
+                lines.append(f"| {tname} | {tcomment} |")
+
+    return "\n".join(lines)
+
+
+def _read_optional_file(topic_dir: str, filename: str) -> str:
+    """Read an optional file from the topic directory, return its content or empty string."""
+    file_path = os.path.join(topic_dir, filename)
+    if not os.path.isfile(file_path):
+        return ""
+    with open(file_path, "r", encoding="utf-8") as f:
+        return f.read().strip()
+
+
+def _generate_mcp_tools_info(mcp_tools: list, lang: str = "zh") -> tuple[str, str]:
+    """Generate MCP tools description and routing rule sections.
+
+    Returns:
+        (mcp_tools_info, mcp_routing_rule) — two strings to fill into the template.
+        If no MCP tools, both are empty strings (the placeholders are removed cleanly).
+    """
+    if not mcp_tools:
+        if lang == "en":
+            return "", "Use the **database** (SQL query) for all questions. Proceed to Step 3."
+        return "", "所有问题均使用**数据库**（SQL 查询）来回答，直接进入步骤 3。"
+
+    # Build tool descriptions table
+    if lang == "en":
+        lines = [
+            "## 🔌 External Data Tools (MCP)",
+            "",
+            "In addition to the SQL database, you also have access to the following **external data tools** provided via MCP servers. "
+            "These tools can query data that is NOT stored in the local database.",
+            "",
+            "| Tool | Description |",
+            "|------|-------------|",
+        ]
+    else:
+        lines = [
+            "## 🔌 外部数据工具（MCP）",
+            "",
+            "除了 SQL 数据库之外，你还可以使用以下通过 MCP 服务器提供的**外部数据工具**。"
+            "这些工具可以查询本地数据库中**没有存储**的数据。",
+            "",
+            "| 工具名称 | 功能说明 |",
+            "|----------|----------|",
+        ]
+
+    for tool in mcp_tools:
+        name = tool.name
+        desc = tool.description.split("\n")[0].strip() if tool.description else ""
+        lines.append(f"| `{name}` | {desc} |")
+
+    mcp_tools_info = "\n".join(lines)
+
+    # Build routing rule
+    tool_names = ", ".join(f"`{t.name}`" for t in mcp_tools)
+    if lang == "en":
+        routing_rule = (
+            f"- **External tools (MCP)**: If the question can be answered by the external tools ({tool_names}), "
+            "call the corresponding MCP tool directly. **No need to go through Steps 3-6 (database query)**. "
+            "After getting the MCP tool result, you can skip directly to Step 7 (Python post-processing) or Step 8 (visualization) if needed, "
+            "then go to Step 9 to format the answer.\n"
+            "- **Database (SQL)**: If the question requires querying data stored in the local database, "
+            "proceed to Step 3 and follow the full database query workflow.\n"
+            "- **Both**: Some questions may need data from both sources. In that case, call MCP tools first, "
+            "then query the database, and combine the results."
+        )
+    else:
+        routing_rule = (
+            f"- **外部工具（MCP）**：如果用户的问题可以通过外部工具（{tool_names}）回答，"
+            "直接调用对应的 MCP 工具即可。**无需经过步骤 3-6（数据库查询）**。"
+            "获得 MCP 工具结果后，可按需跳到步骤 7（Python 后处理）或步骤 8（可视化），"
+            "然后进入步骤 9 格式化答案。\n"
+            "- **数据库（SQL）**：如果问题需要查询本地数据库中存储的数据，"
+            "进入步骤 3，按完整的数据库查询流程执行。\n"
+            "- **两者结合**：某些问题可能同时需要外部工具和数据库的数据。此时先调用 MCP 工具，"
+            "再查询数据库，最后将结果合并分析。"
+        )
+
+    return mcp_tools_info, routing_rule
+
+
+def generate_system_md(
+    topic_dir: str, config: dict, lang: str = "zh", mcp_tools: list | None = None,
+    allowed_models: "set[str] | None" = None,
+) -> str:
+    """Generate the SYSTEM.md content from the template + config context."""
+    template_path = TEMPLATE_PATHS.get(lang, TEMPLATE_PATHS["zh"])
+    with open(template_path, "r", encoding="utf-8") as f:
+        template = f.read()
+
+    # 1. Database Information (filtered by permission)
+    database_info = _generate_database_info(config, topic_dir, allowed_models=allowed_models)
+
+    # 2. Domain Knowledge (optional)
+    dk_content = _read_optional_file(topic_dir, "domain_knowledge.md")
+    domain_knowledge = f"### Domain Knowledge\n\n{dk_content}" if dk_content else ""
+
+    # 3. Case Knowledge (optional)
+    ck_content = _read_optional_file(topic_dir, "case_knowledge.md")
+    case_knowledge = f"{ck_content}" if ck_content else ""
+
+    # 4. Example Approach (optional)
+    ea_content = _read_optional_file(topic_dir, "example_approach.md")
+    example_approach = f"## Example Approach\n\n{ea_content}" if ea_content else ""
+
+    # 5. Current Time — use config value if set, otherwise today's date
+    cur_time = config.get("cur_time", "")
+    if not cur_time:
+        from datetime import date
+        cur_time = date.today().strftime("%Y-%m-%d")
+
+    # 6. MCP tools information
+    mcp_tools_info, mcp_routing_rule = _generate_mcp_tools_info(mcp_tools or [], lang=lang)
+
+    # Fill in placeholders
+    content = template.replace("{{DATABASE_INFO}}", database_info)
+    content = content.replace("{{DOMAIN_KNOWLEDGE}}", domain_knowledge)
+    content = content.replace("{{CASE_KNOWLEDGE}}", case_knowledge)
+    content = content.replace("{{EXAMPLE_APPROACH}}", example_approach)
+    content = content.replace("{{CUR_TIME}}", str(cur_time))
+    content = content.replace("{{MCP_TOOLS_INFO}}", mcp_tools_info)
+    content = content.replace("{{MCP_ROUTING_RULE}}", mcp_routing_rule)
+
+    return content
+
+
+def ensure_system_md(
+    topic_dir: str, config: dict, lang: str = "zh", mcp_tools: list | None = None,
+    allowed_models: "set[str] | None" = None,
+) -> str:
+    """Generate and write SYSTEM.md for a topic. Returns the file path.
+
+    When *allowed_models* is None (no permission filtering), the shared
+    ``topics/<topic>/SYSTEM.md`` is written so that the file can also be
+    inspected manually. When permission filtering is active, only the
+    shared file (with full tables) is written and the filtered content is
+    returned separately via :func:`generate_system_md`.
+    """
+    system_md_path = os.path.join(topic_dir, "SYSTEM.md")
+    full_content = generate_system_md(topic_dir, config, lang=lang, mcp_tools=mcp_tools)
+    with open(system_md_path, "w", encoding="utf-8") as f:
+        f.write(full_content)
+    return system_md_path
+
+
+# ── Agent creation ───────────────────────────────────────────────────────────
+
+def _load_snowflake_credentials(topic_dir: str, config: dict) -> dict:
+    """Load Snowflake credentials from the JSON file specified in config."""
+    cred_file = config.get("snowflake_credential_file", "./snowflake_credential.json")
+    cred_path = os.path.join(topic_dir, cred_file) if not os.path.isabs(cred_file) else cred_file
+    if not os.path.isfile(cred_path):
+        console.print(f"[bold red]Error:[/bold red] Snowflake credential file not found: {cred_path}")
+        sys.exit(1)
+    with open(cred_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def create_sql_deep_agent(
+    topic: str,
+    checkpointer=None,
+    model=None,
+    max_result_chars: int = DEFAULT_MAX_RESULT_CHARS,
+    result_store: LargeResultStore | None = None,
+    lang: str = "en",
+    df_store=None,
+    memory: list[str] | None = None,
+    user_dir: str | None = None,
+    sandbox=None,
+    db_id: str | None = None,
+    user_permissions: dict | None = None,
+    user_name: str = "",
+    user_organization: str = "",
+    custom_schema_dir: str | None = None,
+    skillopt_skill_content: str | None = None,
+    skillopt_database_root_override: str | None = None,
+):
+    """Create and return a text-to-SQL Deep Agent for the given topic.
+
+    Args:
+        topic: Topic name to query.
+        checkpointer: Optional LangGraph checkpointer for multi-turn conversation state.
+        model: Optional pre-configured ChatOpenAI model instance. If None, uses default from config.
+        max_result_chars: Maximum characters for tool results. 0 to disable truncation.
+        result_store: Optional LargeResultStore for saving original (untruncated) results.
+        lang: Language for prompts and tool descriptions ("zh" or "en").
+        db_id: Optional database identifier for multi-DB topics.
+        skillopt_skill_content: Optional SkillOpt skill appended to the fixed
+            system prompt. The base Agent instructions remain unchanged.
+        skillopt_database_root_override: Optional SQLite multi-database root
+            used by SkillOpt to switch between BIRD Train and Dev databases.
+    """
+    topics = discover_topics()
+
+    if topic not in topics:
+        available = ", ".join(topics.keys())
+        console.print(f"[bold red]Error:[/bold red] Unknown topic '{topic}'. Available topics: {available}")
+        sys.exit(1)
+
+    topic_info = topics[topic]
+    topic_dir = topic_info["dir"]
+    config = topic_info["config"]
+
+    # Default user_dir to user_data/_default for standalone usage (eval.py / agent.py)
+    if user_dir is None:
+        user_dir = os.path.join(BASE_DIR, "user_data", "_default")
+    os.makedirs(user_dir, exist_ok=True)
+
+    # Resolve database connection based on db_type
+    db_type = config.get("db_type", "sqlite").lower()
+
+    # Determine schema directory (may differ from topic_dir for multi-DB topics)
+    schema_dir = topic_dir
+
+    if db_type == "snowflake":
+        # Snowflake connection via credential file + db_id
+        # We bypass SQLDatabase/SQLDatabaseToolkit entirely — schema info
+        # comes from pre-converted database.json, SQL execution uses engine directly.
+        if not db_id:
+            console.print(f"[bold red]Error:[/bold red] db_id is required for Snowflake topic '{topic}'")
+            sys.exit(1)
+        creds = _load_snowflake_credentials(topic_dir, config)
+        import snowflake.connector
+        from sqlalchemy import create_engine as _create_engine
+
+        sf_connect_kwargs = {k: v for k, v in creds.items() if k != "session_parameters"}
+        if "username" in sf_connect_kwargs and "user" not in sf_connect_kwargs:
+            sf_connect_kwargs["user"] = sf_connect_kwargs.pop("username")
+
+        def _sf_creator():
+            return snowflake.connector.connect(database=db_id, **sf_connect_kwargs)
+
+        from snowflake.sqlalchemy import URL as _SnowflakeURL
+        _sf_url = _SnowflakeURL(
+            account=creds["account"],
+            user=sf_connect_kwargs.get("user", ""),
+            password="creator_overrides_this",
+            database=db_id,
+        )
+        sf_engine = _create_engine(_sf_url, creator=_sf_creator)
+
+        schemas_root = custom_schema_dir if custom_schema_dir is not None else os.path.join(topic_dir, "schemas")
+        schema_dir = os.path.join(schemas_root, db_id)
+        if not os.path.isdir(schema_dir):
+            console.print(f"[bold yellow]Warning:[/bold yellow] Schema dir not found for db_id '{db_id}': {schema_dir}")
+
+        db = None  # Not used for Snowflake — tools built directly below
+    elif db_type == "sqlite_multi":
+        # Multi-DB SQLite (Spider2-Lite): each db_id maps to a .sqlite file
+        if not db_id:
+            console.print(f"[bold red]Error:[/bold red] db_id is required for sqlite_multi topic '{topic}'")
+            sys.exit(1)
+        # SkillOpt integration: allow Train and Dev to use their own BIRD
+        # database roots. Pure Agent calls leave this unset and retain the
+        # topic configuration's original behavior.
+        sqlite_dir = skillopt_database_root_override or config.get("spider2_sqlite_dir", "")
+
+        # Find the .sqlite file: try flat layout first, then nested (BIRD-style)
+        sqlite_path = os.path.join(sqlite_dir, f"{db_id}.sqlite")
+        if not os.path.isfile(sqlite_path):
+            sqlite_path = os.path.join(sqlite_dir, db_id, f"{db_id}.sqlite")
+        if not os.path.isfile(sqlite_path):
+            console.print(f"[bold red]Error:[/bold red] SQLite file not found for db_id '{db_id}' in {sqlite_dir}")
+            sys.exit(1)
+
+        db = SQLDatabase.from_uri(f"sqlite:///{sqlite_path}", sample_rows_in_table_info=3)
+
+        # Schema comes from pre-converted database.json under schemas/{schema_name}/
+        # The schema dir name may differ from db_id (e.g. "DB_IMDB" vs "Db-IMDB")
+        # Try exact match first, then case-insensitive match
+        schemas_root = custom_schema_dir if custom_schema_dir is not None else os.path.join(topic_dir, "schemas")
+        schema_dir = os.path.join(schemas_root, db_id)
+        if not os.path.isdir(schema_dir):
+            if os.path.isdir(schemas_root):
+                db_id_lower = db_id.lower().replace("-", "_")
+                for d in os.listdir(schemas_root):
+                    if d.lower().replace("-", "_") == db_id_lower:
+                        schema_dir = os.path.join(schemas_root, d)
+                        break
+        if not os.path.isdir(schema_dir):
+            console.print(f"[bold yellow]Warning:[/bold yellow] Schema dir not found for db_id '{db_id}': {schema_dir}")
+    elif db_type == "mysql":
+        # MySQL connection via config parameters
+        mysql_host = config.get("mysql_host", "localhost")
+        mysql_port = config.get("mysql_port", 3306)
+        mysql_user = config.get("mysql_user", "root")
+        mysql_passwd = config.get("mysql_passwd", "")
+        mysql_database = config.get("mysql_database", "")
+        if not mysql_database:
+            console.print(f"[bold red]Error:[/bold red] mysql_database is required for MySQL topic '{topic}'")
+            sys.exit(1)
+        mysql_uri = _SAUrl.create(
+            "mysql+pymysql",
+            username=mysql_user, password=mysql_passwd,
+            host=mysql_host, port=int(mysql_port), database=mysql_database,
+        )
+        db = SQLDatabase.from_uri(mysql_uri, sample_rows_in_table_info=3)
+    elif db_type == "oracle":
+        oracle_host = config.get("oracle_host", "localhost")
+        oracle_port = config.get("oracle_port", 1521)
+        oracle_user = config.get("oracle_user", "")
+        oracle_passwd = config.get("oracle_passwd", "")
+        oracle_service = config.get("oracle_service_name", "")
+        if not oracle_service:
+            console.print(f"[bold red]Error:[/bold red] oracle_service_name is required for Oracle topic '{topic}'")
+            sys.exit(1)
+        oracle_uri = _SAUrl.create(
+            "oracle+oracledb",
+            username=oracle_user, password=oracle_passwd,
+            host=oracle_host, port=int(oracle_port),
+            query={"service_name": oracle_service},
+        )
+        oracle_schema = config.get("oracle_schema", oracle_user.upper()) or oracle_user.upper()
+        db = SQLDatabase.from_uri(oracle_uri, schema=oracle_schema, sample_rows_in_table_info=3)
+    elif db_type == "none":
+        db = None
+    else:
+        # SQLite connection via db_file
+        db_file_rel = config.get("db_file", "")
+        db_path = os.path.join(topic_dir, db_file_rel)
+        if not os.path.isfile(db_path):
+            console.print(f"[bold red]Error:[/bold red] Database file not found: {db_path}")
+            sys.exit(1)
+        db = SQLDatabase.from_uri(f"sqlite:///{db_path}", sample_rows_in_table_info=3)
+        if custom_schema_dir is not None:
+            schema_dir = custom_schema_dir
+
+    # Initialize model: use provided model or load default from model_config.yaml
+    if model is None:
+        mc = load_model_config()
+        default_name = mc.get("default_model")
+        if not default_name or not mc.get("models", {}).get(default_name):
+            console.print("[bold red]Error:[/bold red] No default_model configured in model_config.yaml")
+            sys.exit(1)
+        model = create_model_from_config(default_name, mc)
+
+    # Create custom schema tools (from database.json, works for all db types)
+    quote_ids = (db_type == "snowflake")
+
+    # Entity retrieval: initialize token-based engine for enum-like columns
+    entity_retrieval_engine = None
+    entity_retrieval_enabled = config.get("entity_retrieval", True)
+
+    if entity_retrieval_enabled:
+        entity_retrieval_top_k = int(config.get("entity_retrieval_topk", 50))
+        entity_retrieval_threshold = int(config.get("entity_retrieval_threshold", 50))
+        # Get SQLAlchemy engine for live-querying columns that lack enum_values
+        _er_engine = sf_engine if db_type == "snowflake" else (db._engine if db else None)
+        try:
+            entity_retrieval_engine = EntityRetrievalEngine(
+                top_k=entity_retrieval_top_k,
+                enum_threshold=entity_retrieval_threshold,
+            )
+            if not entity_retrieval_engine.load_index(schema_dir):
+                console.print("[dim]Entity retrieval: token index not found, skipping[/dim]")
+                entity_retrieval_engine = None
+            else:
+                if entity_retrieval_engine._indexes:
+                    console.print(
+                        f"[dim]Entity retrieval loaded "
+                        f"({len(entity_retrieval_engine._indexes)} column indexes)[/dim]"
+                    )
+                else:
+                    console.print("[dim]Entity retrieval: no qualifying columns found[/dim]")
+                    entity_retrieval_engine = None
+        except Exception as e:
+            console.print(f"[bold yellow]Warning:[/bold yellow] Entity retrieval init failed: {e}")
+            entity_retrieval_engine = None
+
+    from tools.custom_schema import current_user_question as _ctx_question
+
+    def _question_getter() -> str | None:
+        return _ctx_question.get()
+
+    # Compute permission-based filters for the current topic
+    from permissions import get_allowed_models_for_topic, build_row_filters_for_topic
+    _allowed_models = get_allowed_models_for_topic(user_permissions, topic)
+    _row_filters = build_row_filters_for_topic(user_permissions, topic)
+
+    custom_schema_tool = create_custom_schema_tool(
+        schema_dir, lang=lang, quote_identifiers=quote_ids,
+        entity_retrieval_engine=entity_retrieval_engine,
+        question_getter=_question_getter,
+        allowed_models=_allowed_models,
+        row_filters=_row_filters if _row_filters else None,
+    )
+    custom_list_tables_tool = create_custom_list_tables_tool(
+        schema_dir, lang=lang, quote_identifiers=quote_ids,
+        allowed_models=_allowed_models,
+    )
+
+    sql_tools = [t for t in [custom_schema_tool, custom_list_tables_tool] if t is not None]
+
+    if db_type == "none":
+        pass
+    elif db_type == "snowflake":
+        from sqlalchemy import text as _text
+        from langchain_core.tools import tool as _tool_decorator
+
+        @_tool_decorator("sql_db_query_raw")
+        def _raw_query(query: str) -> str:
+            """Execute a SQL query against the database and return results."""
+            try:
+                with sf_engine.connect() as conn:
+                    result = conn.execute(_text(query))
+                    rows = result.fetchall()
+                    columns = list(result.keys())
+                if not rows:
+                    return ""
+                return str([dict(zip(columns, row)) for row in rows])
+            except Exception as e:
+                return f"Error: {e}"
+
+        sql_query_tool = create_sql_query_tool(
+            _raw_query,
+            max_result_chars=max_result_chars,
+            result_store=result_store,
+            lang=lang,
+        )
+        sql_tools.append(sql_query_tool)
+    else:
+        toolkit = SQLDatabaseToolkit(db=db, llm=model)
+        all_toolkit_tools = toolkit.get_tools()
+        original_query_tool = next(
+            t for t in all_toolkit_tools if t.name == "sql_db_query"
+        )
+        sql_query_tool = create_sql_query_tool(
+            original_query_tool,
+            max_result_chars=max_result_chars,
+            result_store=result_store,
+            lang=lang,
+        )
+        sql_tools.append(sql_query_tool)
+
+    # Generate SYSTEM.md from template + config
+    system_md = ensure_system_md(topic_dir, config, lang=lang, mcp_tools=[])
+
+    if _allowed_models is not None:
+        system_prompt_content = generate_system_md(
+            topic_dir, config, lang=lang, mcp_tools=[],
+            allowed_models=_allowed_models,
+        )
+    else:
+        with open(system_md, "r", encoding="utf-8") as f:
+            system_prompt_content = f.read()
+
+    # SkillOpt integration: append only the currently evaluated skill. Pure
+    # Agent calls leave this unset and receive the original system prompt.
+    if skillopt_skill_content and skillopt_skill_content.strip():
+        system_prompt_content += (
+            "\n\n"
+            "<LEARNED_TEXT_TO_SQL_SKILL>\n"
+            "The following learned skill supplements the fixed instructions above. "
+            "Apply it when useful, but never override tool constraints, database "
+            "safety requirements, or the required final-answer format.\n\n"
+            f"{skillopt_skill_content.strip()}\n"
+            "</LEARNED_TEXT_TO_SQL_SKILL>"
+        )
+
+    root_dir = user_dir
+    _path_mappings = {}
+
+    # Thread-safe monkey-patching of framework prompts for this language
+    with _PROMPT_LOCK:
+        apply_prompts(lang)
+
+        agent = create_deep_agent(
+            model=model,
+            system_prompt=system_prompt_content,
+            memory=[],
+            skills=[],
+            tools=sql_tools,
+            subagents=[],
+            backend=FilesystemBackendWithMode(
+                root_dir=root_dir, virtual_mode=True,
+                path_mappings=_path_mappings,
+            ),
+            checkpointer=checkpointer,
+        )
+
+    return agent, None
+
+
+# ── CLI ──────────────────────────────────────────────────────────────────────
+
+def list_topics():
+    """Print all available topics."""
+    topics = discover_topics()
+    if not topics:
+        console.print("[bold red]No topics found.[/bold red] Add a topic directory with config.yaml under topics/")
+        return
+
+    console.print("\n[bold cyan]Available Topics:[/bold cyan]\n")
+    for name, info in topics.items():
+        marker = " (default)" if name == DEFAULT_TOPIC else ""
+        console.print(f"  [bold green]{name}[/bold green]{marker}")
+        console.print(f"    {info['description']}")
+        db_type = info["config"].get("db_type", "sqlite").lower()
+        if db_type == "mysql":
+            mysql_host = info["config"].get("mysql_host", "localhost")
+            mysql_port = info["config"].get("mysql_port", 3306)
+            mysql_db = info["config"].get("mysql_database", "")
+            console.print(f"    DB: mysql://{mysql_host}:{mysql_port}/{mysql_db}")
+        elif db_type == "oracle":
+            oracle_host = info["config"].get("oracle_host", "localhost")
+            oracle_port = info["config"].get("oracle_port", 1521)
+            oracle_service = info["config"].get("oracle_service_name", "")
+            console.print(f"    DB: oracle://{oracle_host}:{oracle_port}/{oracle_service}")
+        else:
+            db_file = info["config"].get("db_file", "")
+            console.print(f"    DB: topics/{name}/{db_file}")
+        console.print()
+
+
+def display_messages(messages, start_index: int = 0):
+    """Display agent messages (tool calls, tool results, final answers).
+
+    Args:
+        messages: List of messages from the agent result.
+        start_index: Index to start displaying from (skip already-shown messages).
+    """
+    step = 0
+    # Count existing tool-call steps before start_index for correct step numbering
+    for msg in messages[:start_index]:
+        if getattr(msg, "type", None) == "ai" and getattr(msg, "tool_calls", None):
+            step += 1
+
+    for msg in messages[start_index:]:
+        msg_type = getattr(msg, "type", None)
+
+        # AI message with tool calls (intermediate step)
+        if msg_type == "ai" and getattr(msg, "tool_calls", None):
+            step += 1
+            for tc in msg.tool_calls:
+                console.print(
+                    Panel(
+                        f"[bold yellow]Step {step} - Tool Call:[/bold yellow] {tc['name']}\n"
+                        f"[dim]Args:[/dim] {tc['args']}",
+                        border_style="yellow",
+                    )
+                )
+
+        # Tool result message
+        elif msg_type == "tool":
+            content = msg.content if isinstance(msg.content, str) else str(msg.content)
+            # display = content if len(content) <= 5000 else content[:5000] + "\n... (truncated)"
+            display = content
+            console.print(
+                Panel(
+                    f"[bold magenta]Tool Result:[/bold magenta] {msg.name}\n\n{display}",
+                    border_style="magenta",
+                )
+            )
+
+        # AI text response without tool calls = final answer
+        elif msg_type == "ai" and msg.content and not getattr(msg, "tool_calls", None):
+            console.print(
+                Panel(
+                    f"[bold green]Answer:[/bold green]\n\n{msg.content}",
+                    border_style="green",
+                )
+            )
+
+
+def stream_and_display(agent, input_data: dict, config: dict | None = None) -> dict:
+    """Stream agent execution and display each step in real-time.
+
+    Uses LangGraph's stream(stream_mode="updates") to emit events as each node
+    (model reply, tool call) completes, then displays them immediately.
+
+    Args:
+        agent: The compiled LangGraph agent.
+        input_data: The input dict (e.g. {"messages": [...]}).
+        config: Optional LangGraph config (e.g. for thread_id).
+
+    Returns:
+        The final accumulated state dict with all messages.
+    """
+    # Set current user question for entity retrieval context
+    from tools.custom_schema import current_user_question
+    messages = input_data.get("messages", [])
+    if messages:
+        last_msg = messages[-1]
+        q = last_msg.get("content", "") if isinstance(last_msg, dict) else getattr(last_msg, "content", "")
+        current_user_question.set(q if q else None)
+    else:
+        current_user_question.set(None)
+    step = 0
+    final_messages = []
+
+    # Pre-collect IDs of messages already in the checkpoint so we can skip them
+    # during streaming. This prevents re-printing previous turns' steps.
+    seen_ids: set = set()
+    if config is not None:
+        try:
+            state = agent.get_state(config)
+            if state and state.values and "messages" in state.values:
+                for msg in state.values["messages"]:
+                    msg_id = getattr(msg, "id", None)
+                    if msg_id is not None:
+                        seen_ids.add(msg_id)
+        except Exception:
+            pass
+
+    stream_kwargs = {"stream_mode": "updates"}
+    if config is not None:
+        stream_kwargs["config"] = config
+
+    for event in agent.stream(input_data, **stream_kwargs):
+        # event is a dict like {node_name: {"messages": [msg, ...] | Overwrite(...)}}
+        for node_name, update in event.items():
+            if not isinstance(update, dict):
+                continue
+            raw = update.get("messages", [])
+            if raw is None:
+                continue
+            # LangGraph may wrap the value in an Overwrite object
+            msgs = raw.value if isinstance(raw, Overwrite) else raw
+            if not isinstance(msgs, list):
+                msgs = [msgs]
+            for msg in msgs:
+                # Skip messages that already existed in the checkpoint (previous turns)
+                msg_id = getattr(msg, "id", None)
+                if msg_id is not None and msg_id in seen_ids:
+                    continue
+                if msg_id is not None:
+                    seen_ids.add(msg_id)
+
+                final_messages.append(msg)
+                msg_type = getattr(msg, "type", None)
+
+                # AI message with tool calls (intermediate step)
+                if msg_type == "ai" and getattr(msg, "tool_calls", None):
+                    step += 1
+                    if msg.content:
+                        console.print(
+                            Panel(
+                                f"[bold green]Step {step} - AI Thinking:[/bold green]\n\n{rich_escape(str(msg.content))}",
+                                border_style="green",
+                            )
+                        )
+                    for tc in msg.tool_calls:
+                        console.print(
+                            Panel(
+                                f"[bold yellow]Step {step} - Tool Call:[/bold yellow] {rich_escape(str(tc['name']))}\n"
+                                f"[dim]Args:[/dim] {rich_escape(str(tc['args']))}",
+                                border_style="yellow",
+                            )
+                        )
+
+                # Tool result message
+                elif msg_type == "tool":
+                    content = msg.content if isinstance(msg.content, str) else str(msg.content)
+                    display = rich_escape(content)
+                    console.print(
+                        Panel(
+                            f"[bold magenta]Tool Result:[/bold magenta] {rich_escape(str(msg.name))}\n\n{display}",
+                            border_style="magenta",
+                        )
+                    )
+
+                # AI text response without tool calls = final answer
+                elif msg_type == "ai" and msg.content and not getattr(msg, "tool_calls", None):
+                    console.print(
+                        Panel(
+                            f"[bold green]Answer:[/bold green]\n\n{rich_escape(str(msg.content))}",
+                            border_style="green",
+                        )
+                    )
+
+    return {"messages": final_messages}
+
+
+def run_single_query(agent, question: str):
+    """Run a single question against the agent and display results (streaming)."""
+    console.print("[dim]Processing query...[/dim]\n")
+    try:
+        stream_and_display(
+            agent,
+            {"messages": [{"role": "user", "content": question}]},
+        )
+    except Exception as e:
+        console.print(
+            Panel(f"[bold red]Error:[/bold red]\n\n{str(e)}", border_style="red")
+        )
+        sys.exit(1)
+
+
+def run_chat(agent, topic: str, topic_desc: str):
+    """Run interactive multi-turn conversation loop.
+
+    Args:
+        agent: The compiled deep agent (with checkpointer).
+        topic: Topic name.
+        topic_desc: Topic description.
+    """
+    thread_id = str(uuid.uuid4())
+    config = {"configurable": {"thread_id": thread_id}}
+
+    console.print(
+        Panel(
+            f"[bold cyan]多轮对话模式[/bold cyan]\n"
+            f"Topic: {topic} — {topic_desc}\n\n"
+            f"[dim]输入问题开始对话，输入 [bold]exit[/bold] / [bold]quit[/bold] / [bold]q[/bold] 退出\n"
+            f"输入 [bold]new[/bold] 开始新对话（清除历史）[/dim]",
+            border_style="cyan",
+        )
+    )
+    console.print()
+
+    turn = 0
+    while True:
+        try:
+            question = Prompt.ask(f"[bold blue]You [{turn + 1}][/bold blue]")
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[dim]Bye![/dim]")
+            break
+
+        question = question.strip()
+        if not question:
+            continue
+
+        # Exit commands
+        if question.lower() in ("exit", "quit", "q"):
+            console.print("[dim]Bye![/dim]")
+            break
+
+        # New conversation — reset thread
+        if question.lower() == "new":
+            thread_id = str(uuid.uuid4())
+            config = {"configurable": {"thread_id": thread_id}}
+            turn = 0
+            console.print(
+                Panel("[bold cyan]已开始新对话，历史已清除。[/bold cyan]", border_style="cyan")
+            )
+            console.print()
+            continue
+
+        turn += 1
+        console.print(f"\n[dim]Processing turn {turn}...[/dim]\n")
+
+        try:
+            # stream_mode="updates" already emits only NEW messages per step,
+            # so no need to manually slice the history.
+            stream_and_display(
+                agent,
+                {"messages": [{"role": "user", "content": question}]},
+                config=config,
+            )
+
+        except Exception as e:
+            console.print(
+                Panel(f"[bold red]Error:[/bold red]\n\n{str(e)}", border_style="red")
+            )
+
+        console.print()
+
+
+def main():
+    """Main entry point for the SQL Deep Agent CLI."""
+    topics = discover_topics()
+    available_topics = list(topics.keys()) if topics else []
+
+    # Load model config for help text
+    mc = load_model_config()
+    available_models = list(mc.get("models", {}).keys())
+    default_model_name = mc.get("default_model", "")
+
+    parser = argparse.ArgumentParser(
+        description="Text-to-SQL Deep Agent（模型配置见 model_config.yaml）",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"""
+可用模型: {', '.join(available_models) or '（无）'}
+默认模型: {default_model_name or '（未设置）'}
+
+Examples:
+  python agent.py "查询2025年1月末天河支行的个人客户数" --topic gzns
+  python agent.py "查询2025年1月末天河支行的个人客户数" --model Qwen3-32B
+  python agent.py --chat --topic gzns
+  python agent.py --chat --topic gzns --model Qwen3-32B
+  python agent.py --list-topics
+
+  # Spider2-Snow (Snowflake multi-DB, requires --db-id)
+  python agent.py "How many tables are in this database?" --topic spider2-snow --db-id NORTHWIND --lang en
+  python agent.py "List all category names in the Categories table" --topic spider2-snow --db-id NORTHWIND --lang en
+
+  # Spider2-Lite (SQLite multi-DB, requires --db-id)
+  python agent.py "How many tables are in this database?" --topic spider2-lite --db-id E_commerce --lang en
+  python agent.py "List all customers from SP state" --topic spider2-lite --db-id E_commerce --lang en
+
+  # BIRD (SQLite multi-DB, requires --db-id)
+  python agent.py "What is the highest eligible free rate for K-12 students?" --topic bird --db-id california_schools --lang en
+  python agent.py "How many accounts were opened in 1995?" --topic bird --db-id financial --lang en
+        """,
+    )
+    parser.add_argument(
+        "question",
+        type=str,
+        nargs="?",
+        default=None,
+        help="Natural language question to answer using the database",
+    )
+    parser.add_argument(
+        "--topic", "-t",
+        type=str,
+        default=DEFAULT_TOPIC,
+        choices=available_topics if available_topics else None,
+        help=f"Topic / database to query (default: {DEFAULT_TOPIC})",
+    )
+    parser.add_argument(
+        "--model", "-m",
+        type=str,
+        default=None,
+        help=f"模型名称，对应 model_config.yaml 中的配置 (default: {default_model_name})",
+    )
+    parser.add_argument(
+        "--lang",
+        type=str,
+        default="zh",
+        choices=["zh", "en"],
+        help="Language for the agent (default: zh)",
+    )
+    parser.add_argument(
+        "--chat", "-c",
+        action="store_true",
+        help="Enter interactive multi-turn chat mode",
+    )
+    parser.add_argument(
+        "--list-topics", "-l",
+        action="store_true",
+        help="List all available topics and exit",
+    )
+    parser.add_argument(
+        "--db-id",
+        type=str,
+        default=None,
+        help="Database ID for multi-DB topics (e.g. Spider2-Snow: NORTHWIND, GA4, GA360, ...)",
+    )
+    parser.add_argument(
+        "--tracing",
+        action="store_true",
+        default=False,
+        help="Enable LangSmith tracing (sets LANGCHAIN_TRACING_V2=true)",
+    )
+
+    args = parser.parse_args()
+
+    # ── LangSmith tracing switch ────────────────────────────────────────────
+    if args.tracing:
+        os.environ["LANGCHAIN_TRACING_V2"] = "true"
+        console.print("[dim]LangSmith tracing: [bold green]ON[/bold green][/dim]")
+    else:
+        os.environ["LANGCHAIN_TRACING_V2"] = "false"
+        console.print("[dim]LangSmith tracing: [bold red]OFF[/bold red][/dim]")
+
+    # Handle --list-topics
+    if args.list_topics:
+        list_topics()
+        sys.exit(0)
+
+    # ── Resolve model ────────────────────────────────────────────────────────
+    model_instance = None
+    model_display = default_model_name  # for display only
+    if args.model:
+        model_instance = create_model_from_config(args.model, mc)
+        model_display = args.model
+
+    # ── Create shared result store ─────────────────────────────────────────
+    result_store = LargeResultStore()
+
+    # ── Validate --db-id for multi-DB topics ──────────────────────────────
+    topic_config = topics.get(args.topic, {}).get("config", {})
+    _db_type = topic_config.get("db_type", "").lower()
+    if _db_type in ("snowflake", "sqlite_multi") and not args.db_id:
+        console.print(f"[bold red]Error:[/bold red] --db-id is required for {_db_type} topics (e.g. --db-id NORTHWIND)")
+        sys.exit(1)
+
+    # ── Multi-turn chat mode ────────────────────────────────────────────────
+    if args.chat:
+        topic_desc = topics.get(args.topic, {}).get("description", "")
+        db_label = f" (db_id={args.db_id})" if args.db_id else ""
+        console.print(f"[dim]Creating SQL Deep Agent for topic '{args.topic}'{db_label} with model '{model_display}'...[/dim]")
+        checkpointer = MemorySaver()
+        agent, _ = create_sql_deep_agent(
+            args.topic,
+            checkpointer=checkpointer,
+            model=model_instance,
+            result_store=result_store,
+            db_id=args.db_id,
+            lang=args.lang,
+        )
+        run_chat(agent, args.topic, topic_desc)
+        sys.exit(0)
+
+    # ── Single question mode ────────────────────────────────────────────────
+    if not args.question:
+        parser.print_help()
+        sys.exit(1)
+
+    topic_desc = topics.get(args.topic, {}).get("description", "")
+    db_label = f" (db_id={args.db_id})" if args.db_id else ""
+    console.print(
+        Panel(
+            f"[bold cyan]Topic:[/bold cyan] {args.topic}{db_label} — {topic_desc}\n"
+            f"[bold cyan]Model:[/bold cyan] {model_display}\n"
+            f"[bold cyan]Question:[/bold cyan] {args.question}",
+            border_style="cyan",
+        )
+    )
+    console.print()
+
+    console.print(f"[dim]Creating SQL Deep Agent for topic '{args.topic}'{db_label} with model '{model_display}'...[/dim]")
+    agent, _ = create_sql_deep_agent(
+        args.topic,
+        model=model_instance,
+        result_store=result_store,
+        db_id=args.db_id,
+        lang=args.lang,
+    )
+
+    run_single_query(agent, args.question)
+
+
+if __name__ == "__main__":
+    main()
