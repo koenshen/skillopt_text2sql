@@ -145,10 +145,8 @@ def create_model_from_config(model_name: str, config: dict | None = None) -> Bas
             enable_thinking=cfg.get("enable_thinking", False),
         )
 
-    # Default: OpenAI-compatible provider. ``max_input_tokens`` describes the
-    # model's context capacity for local bookkeeping; it is not an accepted
-    # Chat Completions request parameter. Passing it through ``model_kwargs``
-    # makes the OpenAI client reject every request before it reaches the model.
+    # ``max_input_tokens`` is local context-capacity metadata, not an OpenAI
+    # Chat Completions parameter. Do not forward it through model_kwargs.
     local_metadata_keys = {"model_name", "provider", "max_input_tokens"}
     kwargs = {k: v for k, v in cfg.items() if k not in local_metadata_keys}
     kwargs["model"] = cfg.get("model_name", model_name)
@@ -391,8 +389,11 @@ def create_sql_deep_agent(
     user_name: str = "",
     user_organization: str = "",
     custom_schema_dir: str | None = None,
-    skillopt_skill_content: str | None = None,
-    skillopt_database_root_override: str | None = None,
+    preserve_thinking_turn: int | None = None,
+    use_system_prompt: bool = True,
+    skill_content: str | None = None,
+    learned_skill: str | None = None,
+    database_root_override: str | None = None,
 ):
     """Create and return a text-to-SQL Deep Agent for the given topic.
 
@@ -404,10 +405,15 @@ def create_sql_deep_agent(
         result_store: Optional LargeResultStore for saving original (untruncated) results.
         lang: Language for prompts and tool descriptions ("zh" or "en").
         db_id: Optional database identifier for multi-DB topics.
-        skillopt_skill_content: Optional SkillOpt skill appended to the fixed
-            system prompt. The base Agent instructions remain unchanged.
-        skillopt_database_root_override: Optional SQLite multi-database root
-            used by SkillOpt to switch between BIRD Train and Dev databases.
+        use_system_prompt: Whether to load the project's Text-to-SQL system prompt.
+        skill_content: Optional skill instructions appended to the system prompt.
+        learned_skill: Optional SkillOpt-learned instructions appended after the
+            fixed system prompt and any existing skill_content.
+        database_root_override: Optional SQLite multi-database root used by
+            external evaluators to select a Train or Dev database set.
+        preserve_thinking_turn: Keep only the latest N non-empty assistant
+            reasoning values in the request sent to the model. None disables
+            this request-local transformation.
     """
     topics = discover_topics()
 
@@ -469,10 +475,7 @@ def create_sql_deep_agent(
         if not db_id:
             console.print(f"[bold red]Error:[/bold red] db_id is required for sqlite_multi topic '{topic}'")
             sys.exit(1)
-        # SkillOpt integration: allow Train and Dev to use their own BIRD
-        # database roots. Pure Agent calls leave this unset and retain the
-        # topic configuration's original behavior.
-        sqlite_dir = skillopt_database_root_override or config.get("spider2_sqlite_dir", "")
+        sqlite_dir = database_root_override or config.get("spider2_sqlite_dir", "")
 
         # Find the .sqlite file: try flat layout first, then nested (BIRD-style)
         sqlite_path = os.path.join(sqlite_dir, f"{db_id}.sqlite")
@@ -651,28 +654,41 @@ def create_sql_deep_agent(
         )
         sql_tools.append(sql_query_tool)
 
-    # Generate SYSTEM.md from template + config
-    system_md = ensure_system_md(topic_dir, config, lang=lang, mcp_tools=[])
+    # Generate the project Text-to-SQL system prompt when enabled. Deep Agent's
+    # own middleware remains unchanged in both modes.
+    if use_system_prompt:
+        system_md = ensure_system_md(topic_dir, config, lang=lang, mcp_tools=[])
 
-    if _allowed_models is not None:
-        system_prompt_content = generate_system_md(
-            topic_dir, config, lang=lang, mcp_tools=[],
-            allowed_models=_allowed_models,
-        )
+        if _allowed_models is not None:
+            system_prompt_content = generate_system_md(
+                topic_dir, config, lang=lang, mcp_tools=[],
+                allowed_models=_allowed_models,
+            )
+        else:
+            with open(system_md, "r", encoding="utf-8") as f:
+                system_prompt_content = f.read()
     else:
-        with open(system_md, "r", encoding="utf-8") as f:
-            system_prompt_content = f.read()
+        system_prompt_content = ""
 
-    # SkillOpt integration: append only the currently evaluated skill. Pure
-    # Agent calls leave this unset and receive the original system prompt.
-    if skillopt_skill_content and skillopt_skill_content.strip():
+    if skill_content and skill_content.strip():
+        system_prompt_content += (
+            "\n\n"
+            "<SKILL_CONTENT>\n"
+            "The following skill supplements the fixed instructions above. "
+            "Apply it when useful, but never override tool constraints, database "
+            "safety requirements, or the required final-answer format.\n\n"
+            f"{skill_content.strip()}\n"
+            "</SKILL_CONTENT>"
+        )
+
+    if learned_skill and learned_skill.strip():
         system_prompt_content += (
             "\n\n"
             "<LEARNED_TEXT_TO_SQL_SKILL>\n"
             "The following learned skill supplements the fixed instructions above. "
             "Apply it when useful, but never override tool constraints, database "
             "safety requirements, or the required final-answer format.\n\n"
-            f"{skillopt_skill_content.strip()}\n"
+            f"{learned_skill.strip()}\n"
             "</LEARNED_TEXT_TO_SQL_SKILL>"
         )
 
@@ -682,8 +698,7 @@ def create_sql_deep_agent(
     # Thread-safe monkey-patching of framework prompts for this language
     with _PROMPT_LOCK:
         apply_prompts(lang)
-
-        agent = create_deep_agent(
+        agent_kwargs = dict(
             model=model,
             system_prompt=system_prompt_content,
             memory=[],
@@ -696,6 +711,15 @@ def create_sql_deep_agent(
             ),
             checkpointer=checkpointer,
         )
+        if preserve_thinking_turn is not None:
+            # This is the sole production activation point for the opt-in
+            # thinking plugin.  The CLI validates its model configuration
+            # before reaching this point.
+            from plugins.preserve_thinking import PreserveThinkingPlugin
+
+            plugin = PreserveThinkingPlugin(preserve_thinking_turn)
+            agent_kwargs["middleware"] = [plugin.activate()]
+        agent = create_deep_agent(**agent_kwargs)
 
     return agent, None
 

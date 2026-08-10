@@ -99,6 +99,11 @@ def _register_builtins() -> None:
         _ENV_REGISTRY["swebench"] = SWEBenchAdapter
     except ImportError:
         pass
+    # Unlike optional third-party benchmarks, Text2SQL is an explicitly
+    # requested local integration. Surface its import error instead of hiding
+    # it as an "unknown environment" configuration error.
+    from skillopt.envs.text2sql.adapter import Text2SQLAdapter
+    _ENV_REGISTRY["text2sql"] = Text2SQLAdapter
 
 
 def get_adapter(cfg: dict):
@@ -576,8 +581,10 @@ def load_config(args: argparse.Namespace) -> dict:
                 or default_model_for_backend("minimax_chat")
             )
 
-    # Auto-generate output root
+    # Keep a marker so environment adapters that resolve model aliases can
+    # regenerate the model-bearing directory name before training starts.
     if not flat.get("out_root"):
+        flat["_auto_out_root"] = True
         env = flat.get("env", "unknown")
         model = flat.get("optimizer_model", "unknown").replace("/", "-")
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -592,6 +599,20 @@ def load_config(args: argparse.Namespace) -> dict:
 def main() -> None:
     args = parse_args()
     cfg = load_config(args)
+
+    # Text2SQL derives the optimizer backend/model from the host Agent's
+    # model_config.yaml. This must happen before configuration is displayed
+    # and before the Trainer creates any model client.
+    adapter = get_adapter(cfg)
+    if cfg.get("env") == "text2sql":
+        adapter.setup(cfg)
+        if cfg.pop("_auto_out_root", False):
+            env = cfg.get("env", "unknown")
+            model = str(cfg.get("optimizer_model", "unknown")).replace("/", "-")
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            cfg["out_root"] = os.path.abspath(
+                os.path.join("outputs", f"skillopt_{env}_{model}_{ts}")
+            )
 
     print(f"\n{'='*60}")
     print(f"  SkillOpt — Executive Strategy for Self-Evolving Agent Skills")
@@ -618,9 +639,6 @@ def main() -> None:
     print(f"  slow_update:    {cfg.get('use_slow_update', False)}")
     print(f"  out_root:       {cfg.get('out_root')}")
     print(f"{'='*60}\n")
-
-    # Build adapter
-    adapter = get_adapter(cfg)
 
     # Build trainer and run
     from skillopt.engine.trainer import ReflACTTrainer
