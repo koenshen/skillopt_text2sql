@@ -145,10 +145,8 @@ def create_model_from_config(model_name: str, config: dict | None = None) -> Bas
             enable_thinking=cfg.get("enable_thinking", False),
         )
 
-    # ``max_input_tokens`` is local context-capacity metadata, not an OpenAI
-    # Chat Completions parameter. Do not forward it through model_kwargs.
-    local_metadata_keys = {"model_name", "provider", "max_input_tokens"}
-    kwargs = {k: v for k, v in cfg.items() if k not in local_metadata_keys}
+    # Default: OpenAI-compatible provider
+    kwargs = {k: v for k, v in cfg.items() if k not in ("model_name", "provider", "max_input_tokens")}
     kwargs["model"] = cfg.get("model_name", model_name)
     return ChatOpenAI(**kwargs)
 
@@ -394,6 +392,7 @@ def create_sql_deep_agent(
     skill_content: str | None = None,
     learned_skill: str | None = None,
     database_root_override: str | None = None,
+    sql_execute_timeout: float | None = None,
 ):
     """Create and return a text-to-SQL Deep Agent for the given topic.
 
@@ -414,6 +413,8 @@ def create_sql_deep_agent(
         preserve_thinking_turn: Keep only the latest N non-empty assistant
             reasoning values in the request sent to the model. None disables
             this request-local transformation.
+        sql_execute_timeout: Maximum seconds for each local SQLite
+            ``sql_db_query`` call. None or 0 disables the timeout.
     """
     topics = discover_topics()
 
@@ -651,6 +652,7 @@ def create_sql_deep_agent(
             max_result_chars=max_result_chars,
             result_store=result_store,
             lang=lang,
+            sql_execute_timeout=sql_execute_timeout,
         )
         sql_tools.append(sql_query_tool)
 
