@@ -1,3 +1,9 @@
+'''
+cd ../skillopt_text2sql
+export TEXT2SQL_AGENT_ROOT=../text-to-sql-agent
+../text-to-sql-agent/.venv/bin/python scripts/train.py --config configs/text2sql/test.yaml
+'''
+
 import argparse
 import json
 import os
