@@ -15,7 +15,7 @@ from typing import Callable, Dict, List, Optional, Sequence
 
 from skillopt_sleep.backend import Backend
 from skillopt_sleep.consolidate import ConsolidationResult, consolidate
-from skillopt_sleep.types import TaskRecord
+from skillopt_sleep.types import SkillGroupReport, TaskRecord
 
 CONSOLIDATED = "consolidated"
 SKIPPED = "skipped"
@@ -39,6 +39,7 @@ class GroupConsolidation:
     status: str
     result: Optional[ConsolidationResult] = None
     reason: str = ""
+    n_tasks: int = 0
 
     @property
     def accepted(self) -> bool:
@@ -78,12 +79,20 @@ def consolidate_groups(
     for group in groups:
         name = (group.skill_name or "").strip()
         if not name:
-            out.setdefault("", GroupConsolidation("", SKIPPED, reason="group has no skill name"))
+            # Carry the task count even though the group is unusable: the row
+            # is meant to be that group's own evidence, and reporting 0 tasks
+            # for a group that had several misstates why it was dropped.
+            out.setdefault("", GroupConsolidation(
+                "", SKIPPED, reason="group has no skill name",
+                n_tasks=len(group.tasks),
+            ))
             continue
         if name in out:
             continue  # first group wins; a repeated name is not a second night
         if not group.tasks:
-            out[name] = GroupConsolidation(name, SKIPPED, reason="no mined tasks for this skill")
+            out[name] = GroupConsolidation(
+                name, SKIPPED, reason="no mined tasks for this skill"
+            )
             continue
         try:
             result = consolidate_fn(
@@ -92,11 +101,47 @@ def consolidate_groups(
             )
         except Exception as exc:  # one group's failure must not abort the night
             out[name] = GroupConsolidation(
-                name, FAILED, reason=f"{type(exc).__name__}: {exc}"[:300]
+                name, FAILED, reason=f"{type(exc).__name__}: {exc}"[:300],
+                n_tasks=len(group.tasks),
             )
             continue
-        out[name] = GroupConsolidation(name, CONSOLIDATED, result=result)
+        out[name] = GroupConsolidation(
+            name, CONSOLIDATED, result=result, n_tasks=len(group.tasks)
+        )
     return out
+
+
+def skill_group_reports(
+    outcomes: Dict[str, GroupConsolidation],
+) -> List[SkillGroupReport]:
+    """Build one report row per entry in ``outcomes``, from its evidence only.
+
+    One row per *outcome*, which is at most one per input group: ``outcomes`` is
+    keyed by skill name, so groups that collapsed onto a shared key upstream
+    have already become a single entry and cannot produce a row each.
+
+    A skipped or failed group reports its reason and keeps zeroed scores rather
+    than inheriting another group's numbers, and an accepted group's row is
+    unaffected by its neighbours' decisions.
+    """
+    rows: List[SkillGroupReport] = []
+    for name, outcome in outcomes.items():
+        row = SkillGroupReport(
+            skill_name=name,
+            status=outcome.status,
+            reason=outcome.reason,
+            n_tasks=outcome.n_tasks,
+        )
+        result = outcome.result
+        if result is not None:
+            row.accepted = result.accepted
+            row.gate_action = result.gate_action
+            row.baseline_score = result.baseline_score
+            row.candidate_score = result.candidate_score
+            row.n_applied_edits = len(result.applied_edits)
+            row.n_rejected_edits = len(result.rejected_edits)
+        rows.append(row)
+    return rows
 
 
 def accepted_group_skills(outcomes: Dict[str, GroupConsolidation]) -> Dict[str, str]:

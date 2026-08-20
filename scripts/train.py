@@ -35,6 +35,7 @@ force_utf8_stdout_stderr()
 from skillopt.model.common import default_model_for_backend, normalize_backend_name
 
 _OPENAI_DEFAULT_MODEL_SENTINELS = {"gpt-5.4", "gpt-5.5"}
+_ROLE_BACKEND_DEFAULTS = (None, "", "openai_chat")
 
 
 # ── Environment registry ────────────────────────────────────────────────────
@@ -99,11 +100,6 @@ def _register_builtins() -> None:
         _ENV_REGISTRY["swebench"] = SWEBenchAdapter
     except ImportError:
         pass
-    # Unlike optional third-party benchmarks, Text2SQL is an explicitly
-    # requested local integration. Surface its import error instead of hiding
-    # it as an "unknown environment" configuration error.
-    from skillopt.envs.text2sql.adapter import Text2SQLAdapter
-    _ENV_REGISTRY["text2sql"] = Text2SQLAdapter
 
 
 def get_adapter(cfg: dict):
@@ -148,7 +144,7 @@ def parse_args() -> argparse.Namespace:
     # Legacy flat CLI overrides (still work, prefer --cfg-options for new usage)
     p.add_argument("--env", type=str)
     p.add_argument("--backend", type=str,
-                   choices=["azure_openai", "codex", "codex_exec", "claude", "claude_chat", "claude_code_exec", "cursor", "cursor_exec", "qwen", "qwen_chat", "minimax", "minimax_chat"])
+                   choices=["azure_openai", "codex", "codex_exec", "claude", "claude_chat", "claude_code_exec", "cursor", "cursor_exec", "copilot", "copilot_chat", "copilot_exec", "qwen", "qwen_chat", "minimax", "minimax_chat"])
     p.add_argument("--optimizer_model", type=str)
     p.add_argument("--target_model", type=str)
     p.add_argument("--optimizer_backend", type=str)
@@ -205,7 +201,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--codex_exec_path", type=str)
     p.add_argument("--codex_exec_sandbox", type=str)
     p.add_argument("--codex_exec_profile", type=str)
-    p.add_argument("--codex_exec_full_auto", type=_BOOL)
+    p.add_argument(
+        "--codex_exec_full_auto",
+        type=_BOOL,
+        help=(
+            "Deprecated and ignored; use --codex_exec_sandbox and "
+            "--codex_exec_approval_policy"
+        ),
+    )
     p.add_argument("--codex_exec_reasoning_effort", type=str)
     p.add_argument("--codex_exec_use_sdk", type=str)
     p.add_argument("--codex_exec_network_access", type=_BOOL)
@@ -218,6 +221,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--claude_code_exec_max_thinking_tokens", type=int)
     p.add_argument("--cursor_exec_path", type=str)
     p.add_argument("--cursor_exec_sandbox", type=str)
+    p.add_argument("--copilot_exec_path", type=str)
+    p.add_argument("--copilot_exec_home", type=str)
+    p.add_argument("--copilot_exec_allow_all_tools", type=_BOOL)
+    p.add_argument("--copilot_chat_optimizer_model", type=str)
+    p.add_argument("--copilot_chat_target_model", type=str)
+    p.add_argument("--copilot_chat_timeout", type=int)
     p.add_argument("--codex_trace_to_optimizer", type=_BOOL)
     p.add_argument("--skill_init", type=str)
     p.add_argument("--num_epochs", type=int)
@@ -233,7 +242,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr_control_mode", type=str,
                    choices=["fixed", "autonomous", "none"])
     p.add_argument("--merge_batch_size", type=int)
-    p.add_argument("--max_analyst_rounds", type=int)
+    # Retired, still accepted so existing launch scripts keep running.
+    p.add_argument("--max_analyst_rounds", type=int, help=argparse.SUPPRESS)
     p.add_argument("--sel_env_num", type=int)
     p.add_argument("--test_env_num", type=int)
     p.add_argument("--eval_test", type=_BOOL)
@@ -284,6 +294,72 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mode", type=str)
 
     return p.parse_args()
+
+
+# ── Retired CLI options ──────────────────────────────────────────────────────
+
+# Still parsed so that existing launch scripts do not fail on an unrecognised
+# argument, but deliberately kept out of the config: an option here has no
+# structured path, and without the explicit skip below the mapping loop in
+# ``load_config`` would file it under ``env.<name>``.
+# Flat CLI name -> (the structured key it used to have, why it is gone).
+_RETIRED_CLI_OPTIONS: dict[str, tuple[str, str]] = {
+    "max_analyst_rounds": (
+        "gradient.max_analyst_rounds",
+        "the analyst call count follows from the rollout results, "
+        "gradient.minibatch_size and gradient.failure_only",
+    ),
+}
+
+
+def _lookup_dotted(cfg: dict, dotted: str):
+    """Value at a dotted path in *cfg*, or ``None`` if any level is missing."""
+    node: object = cfg
+    for part in dotted.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return None
+        node = node[part]
+    return node
+
+
+def _retired_option_sources(
+    args: argparse.Namespace,
+    cfg: dict,
+    structured: bool,
+    flat_name: str,
+    dotted: str,
+) -> list[str]:
+    """Every input path that still supplies a retired option.
+
+    The CLI flag is not the only way in, and it is the least dangerous one. A
+    retired key left in a YAML file is dropped in silence: ``flatten_config`` no
+    longer maps it and the trainer no longer reads it, so the run proceeds as
+    though the file had never mentioned it. That silence is what the CLI warning
+    exists to prevent, so the config file and ``--cfg-options`` get the same
+    treatment.
+    """
+    sources: list[str] = []
+    if getattr(args, flat_name, None) is not None:
+        sources.append(f"--{flat_name}")
+
+    accepted = {dotted, flat_name}
+    overrides = [
+        key.strip()
+        for key, separator, _value in (
+            str(option).partition("=")
+            for option in getattr(args, "cfg_options", None) or []
+        )
+        if separator and key.strip() in accepted
+    ]
+    sources.extend(f"--cfg-options {key}" for key in overrides)
+
+    # Only when no override named it: an override is already reported as the
+    # source and is filtered before loading so it cannot change config format.
+    if not overrides:
+        key = dotted if structured else flat_name
+        if _lookup_dotted(cfg, key) is not None:
+            sources.append("the config file")
+    return sources
 
 
 # ── Flat key → structured path mapping (for legacy CLI → structured config) ──
@@ -358,6 +434,12 @@ _LEGACY_TO_STRUCTURED: dict[str, str] = {
     "claude_code_exec_max_thinking_tokens": "model.claude_code_exec_max_thinking_tokens",
     "cursor_exec_path": "model.cursor_exec_path",
     "cursor_exec_sandbox": "model.cursor_exec_sandbox",
+    "copilot_exec_path": "model.copilot_exec_path",
+    "copilot_exec_home": "model.copilot_exec_home",
+    "copilot_exec_allow_all_tools": "model.copilot_exec_allow_all_tools",
+    "copilot_chat_optimizer_model": "model.copilot_chat_optimizer_model",
+    "copilot_chat_target_model": "model.copilot_chat_target_model",
+    "copilot_chat_timeout": "model.copilot_chat_timeout",
     "codex_trace_to_optimizer": "model.codex_trace_to_optimizer",
     "num_epochs": "train.num_epochs",
     "train_size": "train.train_size",
@@ -368,7 +450,6 @@ _LEGACY_TO_STRUCTURED: dict[str, str] = {
     "minibatch_size": "gradient.minibatch_size",
     "merge_batch_size": "gradient.merge_batch_size",
     "analyst_workers": "gradient.analyst_workers",
-    "max_analyst_rounds": "gradient.max_analyst_rounds",
     "failure_only": "gradient.failure_only",
     "edit_budget": "optimizer.learning_rate",
     "min_edit_budget": "optimizer.min_learning_rate",
@@ -453,12 +534,53 @@ def load_config(args: argparse.Namespace) -> dict:
                 stacklevel=2,
             )
 
-    cfg = _load(args.config, overrides=args.cfg_options)
+    # Retired dotted overrides can otherwise create a structured section in a
+    # legacy flat config before format detection.  Filter them before loading;
+    # the original list is still used below to produce the migration warning.
+    _retired_override_keys = set(_RETIRED_CLI_OPTIONS)
+    _retired_override_keys.update(
+        dotted for dotted, _rationale in _RETIRED_CLI_OPTIONS.values()
+    )
+    _active_cfg_options = []
+    for _option in getattr(args, "cfg_options", None) or []:
+        _key, _separator, _value = str(_option).partition("=")
+        if _separator and _key.strip() in _retired_override_keys:
+            continue
+        _active_cfg_options.append(_option)
+
+    cfg = _load(args.config, overrides=_active_cfg_options)
     structured = is_structured(cfg)
+
+    for _retired, (_dotted, _rationale) in _RETIRED_CLI_OPTIONS.items():
+        _sources = _retired_option_sources(args, cfg, structured, _retired, _dotted)
+        if _sources:
+            warnings.warn(
+                f"{_dotted} was retired and is ignored: {_rationale}. "
+                f"Still supplied via {', '.join(_sources)}; remove it.",
+                # FutureWarning rather than DeprecationWarning: ``skillopt-train``
+                # is a console script pointing at ``scripts.train:main``, so this
+                # is raised from an imported module and not from ``__main__``.
+                # Python's default filters are ``default::DeprecationWarning:
+                # __main__`` followed by ``ignore::DeprecationWarning``, which
+                # would drop it before any normal CLI user saw it.
+                FutureWarning,
+                stacklevel=2,
+            )
+
+        # A retired key in a legacy flat file would otherwise survive in the
+        # returned trainer config.  Structured files need the nested key
+        # removed before flattening as well.
+        cfg.pop(_retired, None)
+        _section, _key = _dotted.split(".", 1)
+        _section_cfg = cfg.get(_section)
+        if isinstance(_section_cfg, dict):
+            _section_cfg.pop(_key, None)
 
     # Apply legacy --key value overrides
     cli = {k: v for k, v in vars(args).items()
-           if v is not None and k not in ("config", "cfg_options")}
+           if v is not None
+           and k not in ("config", "cfg_options")
+           and k not in _RETIRED_CLI_OPTIONS}
     if cli:
         if structured:
             from skillopt.config import apply_overrides
@@ -491,6 +613,11 @@ def load_config(args: argparse.Namespace) -> dict:
             if key == "model.backend":
                 explicit_backend = str(option).split("=", 1)[1].strip()
                 break
+    if explicit_backend is None:
+        # ``model.backend`` from a structured YAML file is flattened to
+        # ``model_backend``.  Treat it like the equivalent CLI selection so
+        # its role mapping (and backend-specific model defaults) is applied.
+        explicit_backend = flat.get("model_backend") or flat.get("backend")
 
     backend = normalize_backend_name(flat.get("model_backend") or flat.get("target_backend") or "azure_openai")
 
@@ -506,31 +633,44 @@ def load_config(args: argparse.Namespace) -> dict:
     if explicit_backend is not None:
         backend = normalize_backend_name(explicit_backend)
         flat["model_backend"] = backend
-        if backend in {"claude", "claude_chat"}:
-            flat.setdefault("optimizer_backend", "claude_chat")
-            flat.setdefault("target_backend", "claude_chat")
+
+        def _set_role(key: str, value: str) -> None:
+            if (
+                not _has_model_override(f"model.{key}", key)
+                and flat.get(key) in _ROLE_BACKEND_DEFAULTS
+            ):
+                flat[key] = value
+
+        if backend == "claude_chat":
+            _set_role("optimizer_backend", "claude_chat")
+            _set_role("target_backend", "claude_chat")
         elif backend in {"codex", "codex_exec"}:
-            if not _has_model_override("model.optimizer_backend", "optimizer_backend"):
-                flat["optimizer_backend"] = "codex_exec"
-            if not _has_model_override("model.target_backend", "target_backend"):
-                flat["target_backend"] = "codex_exec"
+            _set_role("optimizer_backend", "codex_exec")
+            _set_role("target_backend", "codex_exec")
         elif backend == "claude_code_exec":
-            flat.setdefault("optimizer_backend", "openai_chat")
-            flat.setdefault("target_backend", "claude_code_exec")
+            _set_role("optimizer_backend", "openai_chat")
+            _set_role("target_backend", "claude_code_exec")
         elif backend == "cursor_exec":
-            if not _has_model_override("model.optimizer_backend", "optimizer_backend"):
-                flat["optimizer_backend"] = "openai_chat"
-            if not _has_model_override("model.target_backend", "target_backend"):
-                flat["target_backend"] = "cursor_exec"
-        elif backend in {"qwen", "qwen_chat"}:
-            flat.setdefault("optimizer_backend", "openai_chat")
-            flat.setdefault("target_backend", "qwen_chat")
-        elif backend in {"minimax", "minimax_chat"}:
-            flat.setdefault("optimizer_backend", "openai_chat")
-            flat.setdefault("target_backend", "minimax_chat")
+            _set_role("optimizer_backend", "openai_chat")
+            _set_role("target_backend", "cursor_exec")
+        elif backend == "copilot_chat":
+            _set_role("optimizer_backend", "copilot_chat")
+            _set_role("target_backend", "copilot_chat")
+        elif backend == "copilot_exec":
+            _set_role("optimizer_backend", "openai_chat")
+            _set_role("target_backend", "copilot_exec")
+        elif backend == "qwen_chat":
+            _set_role("optimizer_backend", "openai_chat")
+            _set_role("target_backend", "qwen_chat")
+        elif backend == "minimax_chat":
+            _set_role("optimizer_backend", "openai_chat")
+            _set_role("target_backend", "minimax_chat")
+        elif backend == "openai_compatible":
+            _set_role("optimizer_backend", "openai_compatible")
+            _set_role("target_backend", "openai_compatible")
         else:
-            flat.setdefault("optimizer_backend", "openai_chat")
-            flat.setdefault("target_backend", "openai_chat")
+            _set_role("optimizer_backend", "openai_chat")
+            _set_role("target_backend", "openai_chat")
     else:
         flat.setdefault("optimizer_backend", "openai_chat")
         flat.setdefault("target_backend", "openai_chat")
@@ -565,6 +705,13 @@ def load_config(args: argparse.Namespace) -> dict:
             and not _has_model_override("model.target", "target_model")
         ):
             flat["target_model"] = default_model_for_backend("cursor_exec")
+    if flat.get("target_backend") == "copilot_exec":
+        if (
+            str(flat.get("target_model", "") or "").strip() in _OPENAI_DEFAULT_MODEL_SENTINELS
+            and not _has_model_override("model.target", "target_model")
+        ):
+            # Copilot CLI model IDs are independent of Azure deployment names.
+            flat["target_model"] = ""
     if flat.get("target_backend") == "qwen_chat":
         if (
             str(flat.get("target_model", "") or "").strip() in _OPENAI_DEFAULT_MODEL_SENTINELS
@@ -581,10 +728,8 @@ def load_config(args: argparse.Namespace) -> dict:
                 or default_model_for_backend("minimax_chat")
             )
 
-    # Keep a marker so environment adapters that resolve model aliases can
-    # regenerate the model-bearing directory name before training starts.
+    # Auto-generate output root
     if not flat.get("out_root"):
-        flat["_auto_out_root"] = True
         env = flat.get("env", "unknown")
         model = flat.get("optimizer_model", "unknown").replace("/", "-")
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -599,20 +744,6 @@ def load_config(args: argparse.Namespace) -> dict:
 def main() -> None:
     args = parse_args()
     cfg = load_config(args)
-
-    # Text2SQL derives the optimizer backend/model from the host Agent's
-    # model_config.yaml. This must happen before configuration is displayed
-    # and before the Trainer creates any model client.
-    adapter = get_adapter(cfg)
-    if cfg.get("env") == "text2sql":
-        adapter.setup(cfg)
-        if cfg.pop("_auto_out_root", False):
-            env = cfg.get("env", "unknown")
-            model = str(cfg.get("optimizer_model", "unknown")).replace("/", "-")
-            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            cfg["out_root"] = os.path.abspath(
-                os.path.join("outputs", f"skillopt_{env}_{model}_{ts}")
-            )
 
     print(f"\n{'='*60}")
     print(f"  SkillOpt — Executive Strategy for Self-Evolving Agent Skills")
@@ -639,6 +770,9 @@ def main() -> None:
     print(f"  slow_update:    {cfg.get('use_slow_update', False)}")
     print(f"  out_root:       {cfg.get('out_root')}")
     print(f"{'='*60}\n")
+
+    # Build adapter
+    adapter = get_adapter(cfg)
 
     # Build trainer and run
     from skillopt.engine.trainer import ReflACTTrainer

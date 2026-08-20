@@ -129,6 +129,30 @@ class EditRecord:
 
 
 @dataclass
+class SkillGroupReport:
+    """One skill group's own gate evidence for the night.
+
+    Every field describes that group alone: its baseline, its candidate score,
+    its decision, and why. Groups never share rows, so a weak group cannot
+    borrow a strong group's evidence or block its acceptance.
+    """
+
+    skill_name: str
+    status: str = ""                   # consolidated | skipped | failed
+    accepted: bool = False
+    gate_action: str = ""
+    baseline_score: float = 0.0
+    candidate_score: float = 0.0
+    n_tasks: int = 0
+    n_applied_edits: int = 0
+    n_rejected_edits: int = 0
+    reason: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class SleepReport:
     """Everything one night produced — written to staging for review."""
 
@@ -154,8 +178,17 @@ class SleepReport:
     # list above — without them a night can report no edits while the optimizer
     # actually produced several.
     unmatched_edits: List[EditRecord] = field(default_factory=list)
+    # Per-skill gate rows for a multi-skill night, in first-seen order. Empty on
+    # a single-managed-skill night, so the fields above remain the whole story
+    # for consumers that predate skill groups.
+    skill_groups: List[SkillGroupReport] = field(default_factory=list)
     tokens_used: int = 0
     notes: List[str] = field(default_factory=list)
+    # Keep new optional fields last to preserve positional construction.
+    gate_no_regression: bool = False
+    # Per-candidate held-out comparisons, including rejected intermediate
+    # skill/memory trials and the final replay.
+    gate_trials: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)

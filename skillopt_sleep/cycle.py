@@ -9,6 +9,7 @@ CI use. With backend="anthropic" it spends the user's budget for real lift.
 """
 from __future__ import annotations
 
+import math
 import os
 import shutil
 import sys
@@ -17,15 +18,19 @@ from typing import List, Optional
 
 from skillopt_sleep import evidence
 from skillopt_sleep.backend import Backend, CursorBackendError, build_backend
-from skillopt_sleep.evidence import EvidenceLog
 from skillopt_sleep.config import SleepConfig, load_config
 from skillopt_sleep.dream import dream_consolidate
+from skillopt_sleep.evidence import EvidenceLog
 from skillopt_sleep.harvest_sources import harvest_for_config
 from skillopt_sleep.memory import ensure_skill_scaffold
-from skillopt_sleep.mine import mine
+from skillopt_sleep.mine import group_tasks_by_skill_hint, mine
+from skillopt_sleep.multi_skill import (
+    SkillGroup,
+    consolidate_groups,
+    skill_group_reports,
+)
 from skillopt_sleep.staging import adopt as adopt_staging
-from skillopt_sleep.staging import redact_secrets
-from skillopt_sleep.staging import write_staging
+from skillopt_sleep.staging import json_safe, redact_secrets, write_staging
 from skillopt_sleep.state import SleepState, _now_iso
 from skillopt_sleep.types import SessionDigest, SleepReport, TaskRecord
 
@@ -50,6 +55,7 @@ def _make_model_key(cfg: SleepConfig) -> str:
             codex_path=cfg.get("codex_path", ""),
             pi_path=cfg.get("pi_path", ""),
             cursor_path=cfg.get("cursor_path", ""),
+            opencode_path=cfg.get("opencode_path", ""),
             azure_endpoint=cfg.get("azure_endpoint", ""),
             project_dir=cfg.get("invoked_project", "") or os.getcwd(),
         )
@@ -160,6 +166,29 @@ def _discard_unstaged_evidence(path: str) -> None:
             break
 
 
+def _markdown_table_text(value: object) -> str:
+    """Keep untrusted evidence text inside one readable Markdown table cell."""
+    text = " ".join(str(value).splitlines())
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("|", "&#124;")
+        .replace("`", "&#96;")
+    )
+
+
+def _report_score(value: object) -> str:
+    """Render an optional numeric score without breaking the report."""
+    if value is None:
+        return "—"
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    return f"{score:.3f}" if math.isfinite(score) else "—"
+
+
 def _render_report_md(report: SleepReport, cfg: SleepConfig) -> str:
     lines = [
         f"# SkillOpt-Sleep — night {report.night} report",
@@ -168,8 +197,11 @@ def _render_report_md(report: SleepReport, cfg: SleepConfig) -> str:
         f"- backend: `{cfg.get('backend')}`  replay: `{cfg.get('replay_mode')}`",
         f"- sessions harvested: {report.n_sessions}",
         f"- tasks mined: {report.n_tasks}  (replayed: {report.n_replayed})",
-        f"- held-out score: {report.baseline_score:.3f} -> {report.candidate_score:.3f}",
+        f"- held-out score: {_report_score(report.baseline_score)} "
+        f"-> {_report_score(report.candidate_score)}",
         f"- gate: **{report.gate_action}** (accepted={report.accepted})",
+        f"- no-regression gate: "
+        f"{'enabled' if cfg.get('gate_no_regression', False) else 'disabled'}",
         f"- tokens used: {report.tokens_used}",
         "",
     ]
@@ -186,6 +218,42 @@ def _render_report_md(report: SleepReport, cfg: SleepConfig) -> str:
             "suggestions, not rejections.",
             "",
         ]
+    if report.gate_trials:
+        lines.append("## Held-out task changes")
+        lines.append(
+            "_These are observed score changes under the configured gate metric; "
+            "they do not establish that a particular edit caused the change._"
+        )
+        lines.append("")
+        for trial in report.gate_trials:
+            target = _markdown_table_text(trial.get("target", "candidate"))
+            accepted = bool(trial.get("accepted", False))
+            blocked = bool(trial.get("blocked_by_regression", False))
+            decision = "accepted" if accepted else "rejected"
+            if blocked:
+                decision += " (task regression)"
+            baseline = _report_score(trial.get("baseline_score"))
+            candidate = _report_score(trial.get("candidate_score"))
+            lines.append(
+                f"### `{target}` candidate — {decision} "
+                f"({baseline} → {candidate})"
+            )
+            lines.append("")
+            lines.append("| Task | Tags | Baseline | Candidate | Change |")
+            lines.append("|---|---|---:|---:|---|")
+            for delta in trial.get("task_deltas", []):
+                task_id = _markdown_table_text(delta.get("task_id", ""))
+                tags = _markdown_table_text(
+                    ", ".join(str(tag) for tag in delta.get("tags", [])) or "—"
+                )
+                baseline_score = _report_score(delta.get("baseline_score"))
+                candidate_score = _report_score(delta.get("candidate_score"))
+                status = _markdown_table_text(delta.get("status", "unchanged"))
+                lines.append(
+                    f"| `{task_id}` | {tags} | {baseline_score} "
+                    f"| {candidate_score} | {status} |"
+                )
+            lines.append("")
     if report.edits:
         lines.append("## Accepted edits")
         for e in report.edits:
@@ -210,6 +278,43 @@ def _render_report_md(report: SleepReport, cfg: SleepConfig) -> str:
         for e in report.unmatched_edits:
             anchor = f"  \n  _anchor: `{e.anchor}`_" if e.anchor else ""
             lines.append(f"- [{e.target}/{e.op}] {e.content}{anchor}")
+        lines.append("")
+    if report.skill_groups:
+        # The reviewer decides per skill, so the per-skill verdicts belong on
+        # the page they actually read. Without this the rows reach report.json
+        # only, and a human reviewing the night sees a single aggregate verdict
+        # that no individual skill necessarily earned.
+        lines.append("## Per-skill groups")
+        lines.append(
+            "_Each row is one skill's own evidence and its own gate decision. "
+            "A rejected group does not block its neighbours, and an accepted "
+            "one does not vouch for them._")
+        lines.append("")
+        lines.append("| Skill | Decision | Gate | Tasks | Held-out | Edits |")
+        lines.append("|---|---|---|---|---|---|")
+        for g in report.skill_groups:
+            name = _markdown_table_text(g.skill_name or "_(no skill name)_")
+            if g.status == "consolidated":
+                decision = "accepted" if g.accepted else "rejected"
+                scores = f"{g.baseline_score:.3f} → {g.candidate_score:.3f}"
+                if g.gate_action == "reject_unverified":
+                    # This is the one score the gate explicitly refuses to
+                    # trust: it was measured on the same tasks the edits came
+                    # from, which is how a reward hack reaches 1.000. Printing
+                    # it bare reads as an improvement that was rejected for no
+                    # reason, so say why the number does not count.
+                    scores += " (unvalidated)"
+                edits = f"{g.n_applied_edits} applied / {g.n_rejected_edits} rejected"
+            else:
+                # skipped and failed groups never reached the gate; showing a
+                # 0.000 score for them would read as a measured result.
+                decision = g.status
+                scores = "—"
+                edits = "—"
+            reason = f" — {_markdown_table_text(g.reason)}" if g.reason else ""
+            lines.append(
+                f"| `{name}` | **{decision}**{reason} | {g.gate_action or '—'} "
+                f"| {g.n_tasks} | {scores} | {edits} |")
         lines.append("")
     if report.notes:
         lines.append("## Notes")
@@ -254,6 +359,7 @@ def run_sleep_cycle(
         codex_path=cfg.get("codex_path", ""),
         pi_path=cfg.get("pi_path", ""),
         cursor_path=cfg.get("cursor_path", ""),
+        opencode_path=cfg.get("opencode_path", ""),
         azure_endpoint=cfg.get("azure_endpoint", ""),
         preferences=cfg.get("preferences", ""),
         project_dir=project,
@@ -291,7 +397,8 @@ def run_sleep_cycle(
                config={k: cfg.get(k) for k in (
                    "backend", "model", "optimizer_backend", "optimizer_model",
                    "target_backend", "target_model", "gate_mode", "gate_metric",
-                   "gate_mixed_weight", "edit_budget", "holdout_fraction",
+                   "gate_mixed_weight", "gate_no_regression", "edit_budget",
+                   "holdout_fraction",
                    "dream_rollouts", "dream_factor", "recall_k",
                    "max_tasks_per_night", "lookback_hours", "llm_mine",
                    "evolve_skill", "evolve_memory")})
@@ -407,6 +514,7 @@ def run_sleep_cycle(
     report = SleepReport(
         night=night, project=project, started_at=started,
         n_sessions=n_sessions, n_tasks=len(tasks),
+        gate_no_regression=bool(cfg.get("gate_no_regression", False)),
     )
 
     if not tasks:
@@ -442,6 +550,7 @@ def run_sleep_cycle(
             edit_budget=cfg.get("edit_budget", 4),
             gate_metric=cfg.get("gate_metric", "mixed"),
             gate_mixed_weight=cfg.get("gate_mixed_weight", 0.5),
+            gate_no_regression=cfg.get("gate_no_regression", False),
             gate_mode=cfg.get("gate_mode", "on"),
             evolve_skill=cfg.get("evolve_skill", True),
             evolve_memory=cfg.get("evolve_memory", True),
@@ -469,6 +578,47 @@ def run_sleep_cycle(
     report.edits = result.applied_edits
     report.rejected_edits = result.rejected_edits
     report.unmatched_edits = result.unmatched_edits
+    report.gate_trials = redact_secrets(getattr(result, "gate_trials", []))
+
+    # ── 4b. optional per-skill group reporting ───────────────────────────
+    # Off by default. When enabled, tonight's tasks are grouped by their skill
+    # hint and each group is consolidated independently so the report carries a
+    # row per skill instead of one aggregate verdict. This costs one extra
+    # consolidation per hinted group, which is why it is opt-in rather than
+    # automatic; a night whose evidence produces only the catch-all group adds
+    # no rows and no calls.
+    #
+    # Each group currently starts from the same managed document. Resolving a
+    # hinted group to its own live SKILL.md is the resolver's job and is not
+    # wired here yet, so a row describes what that group's evidence did to the
+    # managed skill, not to a separate file.
+    if cfg.get("multi_skill_report", False):
+        managed_name = cfg.get("managed_skill_name", "skillopt-sleep-learned")
+        grouped = group_tasks_by_skill_hint(tasks, managed_name)
+        only_catch_all = len(grouped) == 1 and managed_name in grouped
+        if grouped and not only_catch_all:
+            _progress(cfg, f"multi-skill report: groups={len(grouped)}")
+            group_outcomes = consolidate_groups(
+                backend,
+                [SkillGroup(name, skill, rows) for name, rows in grouped.items()],
+                memory,
+                edit_budget=cfg.get("edit_budget", 4),
+                gate_metric=cfg.get("gate_metric", "mixed"),
+                gate_mixed_weight=cfg.get("gate_mixed_weight", 0.5),
+                gate_no_regression=cfg.get("gate_no_regression", False),
+                gate_mode=cfg.get("gate_mode", "on"),
+                night=night,
+            )
+            group_rows = skill_group_reports(group_outcomes)
+            # Skill hints and isolated backend failures are both untrusted
+            # free text. Scrub them before either report.json or report.md is
+            # rendered so staging cannot turn a failed call into a credential
+            # leak.
+            for row in group_rows:
+                row.skill_name = str(redact_secrets(row.skill_name))
+                row.reason = str(redact_secrets(row.reason))
+            report.skill_groups = group_rows
+
     report.tokens_used = backend.tokens_used()
     report.ended_at = _now_iso(clock)
 
@@ -505,25 +655,34 @@ def run_sleep_cycle(
             # credentials (e.g. a codex 401 stderr dump), so scrub secret-looking
             # substrings before persisting them to the on-disk diagnostics.
             with open(os.path.join(staging_dir, "diagnostics.json"), "w", encoding="utf-8") as _fh:
-                _json.dump({
-                    "night": night,
-                    "backend": cfg.get("backend"),
-                    "gate_mode": cfg.get("gate_mode"),
-                    "n_tasks": len(tasks),
-                    "baseline_score": result.baseline_score,
-                    "candidate_score": result.candidate_score,
-                    "accepted": result.accepted,
-                    "gate_action": result.gate_action,
-                    "holdout_leaked": getattr(result, "holdout_leaked", False),
-                    "n_applied_edits": len(result.applied_edits),
-                    "n_rejected_edits": len(result.rejected_edits),
-                    "n_unmatched_edits": len(result.unmatched_edits),
-                    "call_error": redact_secrets(getattr(result, "call_error", "")),
-                    "reflect_raw_head": redact_secrets(
-                        (getattr(result, "reflect_raw", "") or "")[:1200]
-                    ),
-                    "holdout_detail": redact_secrets(getattr(result, "holdout_detail", [])),
-                }, _fh, indent=2)
+                _json.dump(
+                    json_safe({
+                        "night": night,
+                        "backend": cfg.get("backend"),
+                        "gate_mode": cfg.get("gate_mode"),
+                        "gate_no_regression": cfg.get("gate_no_regression", False),
+                        "n_tasks": len(tasks),
+                        "baseline_score": result.baseline_score,
+                        "candidate_score": result.candidate_score,
+                        "accepted": result.accepted,
+                        "gate_action": result.gate_action,
+                        "holdout_leaked": getattr(result, "holdout_leaked", False),
+                        "n_applied_edits": len(result.applied_edits),
+                        "n_rejected_edits": len(result.rejected_edits),
+                        "n_unmatched_edits": len(result.unmatched_edits),
+                        "call_error": redact_secrets(getattr(result, "call_error", "")),
+                        "reflect_raw_head": redact_secrets(
+                            (getattr(result, "reflect_raw", "") or "")[:1200]
+                        ),
+                        "holdout_detail": redact_secrets(
+                            getattr(result, "holdout_detail", [])
+                        ),
+                        "gate_trials": report.gate_trials,
+                    }),
+                    _fh,
+                    indent=2,
+                    allow_nan=False,
+                )
         except Exception:
             pass
         state.set_last_harvest(project, started)

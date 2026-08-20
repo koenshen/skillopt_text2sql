@@ -9,13 +9,21 @@ import shutil
 import subprocess
 import threading
 import traceback
+import warnings
 from typing import Any
 
 from skillopt.model.backend_config import (
+    build_codex_exec_cli_config_overrides,
     get_claude_code_exec_config,
     get_codex_exec_config,
+    get_copilot_exec_config,
     get_cursor_exec_config,
     get_target_backend,
+    validate_exec_sandbox,
+)
+from skillopt.model.copilot_backend import (
+    build_copilot_subprocess_env,
+    parse_copilot_jsonl,
 )
 
 ANSWER_SCHEMA: dict[str, Any] = {
@@ -930,7 +938,6 @@ def _run_codex_cli_exec(
     images: list[str] | None = None,
     data_dirs: list[str] | None = None,
     sandbox: str | None = None,
-    full_auto: bool | None = None,
 ) -> tuple[str, str]:
     config = get_codex_exec_config()
     last_message_path = os.path.join(work_dir, "codex_last_message.txt")
@@ -948,12 +955,15 @@ def _run_codex_cli_exec(
     reasoning_effort = str(config.get("reasoning_effort", "")).strip()
     if reasoning_effort:
         cmd.extend(["-c", f'model_reasoning_effort="{reasoning_effort}"'])
-    actual_full_auto = bool(config.get("full_auto", True)) if full_auto is None else bool(full_auto)
     actual_sandbox = str(sandbox or config["sandbox"])
-    if actual_full_auto:
-        cmd.append("--full-auto")
-    else:
-        cmd.extend(["--sandbox", actual_sandbox])
+    validate_exec_sandbox(actual_sandbox)
+    cmd.extend(["--sandbox", actual_sandbox])
+
+    approval_policy = str(config.get("approval_policy", "never")).strip()
+    if approval_policy:
+        cmd.extend(["-c", f'approval_policy="{approval_policy}"'])
+    for override in build_codex_exec_cli_config_overrides(config):
+        cmd.extend(["-c", override])
     if model:
         cmd.extend(["-m", model])
     for data_dir in data_dirs or []:
@@ -1013,6 +1023,13 @@ def run_codex_exec(
     sandbox: str | None = None,
     full_auto: bool | None = None,
 ) -> tuple[str, str]:
+    if full_auto is not None:
+        warnings.warn(
+            "full_auto is deprecated and ignored; configure sandbox and "
+            "approval_policy explicitly instead",
+            FutureWarning,
+            stacklevel=2,
+        )
     config = get_codex_exec_config()
     mode = _sdk_mode(config.get("use_sdk"))
     retries = int(config.get("empty_response_retries", 0) or 0)
@@ -1057,7 +1074,6 @@ def run_codex_exec(
                 images=images,
                 data_dirs=data_dirs,
                 sandbox=sandbox,
-                full_auto=full_auto,
             )
             all_raw.append(f"===== CODEX CLI ATTEMPT {attempt + 1} =====\n{raw}")
             last_response = response
@@ -1304,6 +1320,108 @@ def run_cursor_exec(
     raise RuntimeError(last_error)
 
 
+def run_copilot_exec(
+    *,
+    work_dir: str,
+    prompt: str,
+    model: str,
+    timeout: int,
+    images: list[str] | None = None,
+    data_dirs: list[str] | None = None,
+    allow_file_edits: bool = False,
+) -> tuple[str, str]:
+    """Run the GitHub Copilot CLI headlessly as a benchmark target.
+
+    Uses ``copilot -p <prompt> --output-format json`` and parses the emitted
+    JSONL event stream, concatenating ``assistant.message`` content. The plain
+    text / ``--silent`` modes do not reliably stream the response to stdout on
+    every platform, so JSONL is used for robust capture.
+    """
+    config = get_copilot_exec_config()
+    retries = int(config.get("empty_response_retries", 0) or 0)
+    add_dirs = _validated_add_dirs(work_dir, data_dirs, images)[1:]
+    all_raw: list[str] = []
+    last_error = "Copilot CLI returned no response"
+    allow_all_tools = str(config.get("allow_all_tools", "0")) == "1"
+
+    for attempt in range(retries + 1):
+        attempt_prompt = _exec_prompt(
+            _retry_prompt(prompt, attempt),
+            allow_file_edits=allow_file_edits,
+        )
+        cmd = [
+            str(config["path"]),
+            "-p",
+            attempt_prompt,
+            "--output-format",
+            "json",
+            "--stream",
+            "off",
+            "--no-color",
+            "--log-level",
+            "none",
+            "-C",
+            work_dir,
+            "--disable-builtin-mcps",
+            "--no-custom-instructions",
+        ]
+        # Read-only rollouts keep the CLI's approval gate; only opt in to
+        # unattended tool use when the caller explicitly allows file edits and
+        # the operator has enabled it.
+        if allow_file_edits and allow_all_tools:
+            cmd.append("--allow-all-tools")
+        if model:
+            cmd.extend(["--model", model])
+        for path in add_dirs:
+            cmd.extend(["--add-dir", path])
+
+        home = str(config.get("home") or "")
+        env = build_copilot_subprocess_env(home)
+
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=work_dir,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                encoding="utf-8",
+                errors="replace",
+                env=env,
+            )
+        except subprocess.TimeoutExpired:
+            # Nothing to capture here: all_raw is local and this path re-raises,
+            # and TimeoutExpired already carries .stdout/.stderr for the caller.
+            raise
+        except OSError as exc:
+            raise RuntimeError(f"Copilot CLI could not be executed: {exc}") from exc
+
+        stdout = proc.stdout or ""
+        stderr = proc.stderr or ""
+        safe_raw = stdout
+        if stderr:
+            safe_raw = f"{safe_raw}\n[stderr]\n{stderr}" if safe_raw else f"[stderr]\n{stderr}"
+        all_raw.append(f"===== COPILOT CLI ATTEMPT {attempt + 1} =====\n{safe_raw}")
+        combined = "\n\n".join(all_raw)
+
+        if proc.returncode != 0:
+            detail = (stderr or stdout).strip()[:4000]
+            raise RuntimeError(
+                f"Copilot CLI failed with exit code {proc.returncode}: {detail}"
+            )
+
+        response = parse_copilot_jsonl(stdout)
+        if response:
+            return response, combined
+
+    combined = "\n\n".join(all_raw)
+    # Without this the caller gets a bare "returned no response" and no CLI
+    # output at all, since copilot_exec persists no artifacts; include a
+    # bounded tail so an empty/invalid JSONL stream is debuggable.
+    detail = combined.strip()[-4000:]
+    raise RuntimeError(f"{last_error}\n{detail}" if detail else last_error)
+
+
 def run_target_exec(
     *,
     work_dir: str,
@@ -1351,6 +1469,16 @@ def run_target_exec(
             images=images,
             data_dirs=data_dirs,
             sandbox=sandbox,
+            allow_file_edits=allow_file_edits,
+        )
+    if backend == "copilot_exec":
+        return run_copilot_exec(
+            work_dir=work_dir,
+            prompt=prompt,
+            model=model,
+            timeout=timeout,
+            images=images,
+            data_dirs=data_dirs,
             allow_file_edits=allow_file_edits,
         )
     raise ValueError(f"Unsupported exec backend: {backend}")

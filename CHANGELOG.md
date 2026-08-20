@@ -7,6 +7,27 @@ All notable changes to SkillOpt are documented here. This project adheres to
 ## [Unreleased]
 
 ### Added
+- Additive `section_contains` rule-judge operator for literal,
+  case-insensitive matching within numbered, bilingual, or annotated ATX
+  Markdown headings. The legacy `section_present` behavior is unchanged.
+- **OpenCode transcript source** (`--source opencode`) for SkillOpt-Sleep. It
+  reads visible user/assistant text and tool names from OpenCode's local SQLite
+  history without requiring its CLI, login, or a provider connection.
+- **OpenCode CLI backend** (`--backend opencode`) for SkillOpt-Sleep model calls,
+  including plain task replay, using an installed OpenCode CLI with the user's
+  existing login and file-based global configuration. Calls parse OpenCode's
+  JSONL output and disable project configuration, tool use, external plugins,
+  and configured MCP servers. Tool-aware replay remains follow-up work.
+- **GitHub Copilot CLI backend**, in two forms: `copilot_chat` (usable as both
+  optimizer and target) and `copilot_exec` (target-only execution harness).
+  Because the Copilot CLI carries its own sign-in, `--backend copilot` selects
+  `copilot_chat` for both roles and runs a complete train/eval loop with no
+  separate provider API key; inference still uses the GitHub Copilot cloud
+  service. Chat calls disable all built-in tools, built-in MCP servers, and
+  custom instructions, strip inherited `COPILOT_ALLOW_ALL`, and never pass
+  `--allow-all-tools`; `copilot_exec` requires an explicit
+  `copilot_exec_allow_all_tools` opt-in before granting unattended tool use.
+  The CLI reports no token counts, so usage totals are zero for these backends.
 - A non-destructive Devin installer and SessionEnd activity marker, preserving
   existing project hooks across repeated installation.
 - Per-night SkillOpt-Sleep `evidence.jsonl` chains for reconstructing harvest,
@@ -46,8 +67,17 @@ All notable changes to SkillOpt are documented here. This project adheres to
   unsupported temperature parameters (thanks @chirag127, #128).
 - Configuration files are read explicitly as UTF-8 (thanks @nankingjing,
   #124).
+- `gradient.max_analyst_rounds` is retired: it was parsed and logged but never
+  reached reflection. Every way of still supplying it (`--max_analyst_rounds`,
+  `--cfg-options`, or a structured or legacy flat config file) is accepted and
+  warns rather than being dropped in silence (reported by @xs229 in #213;
+  implemented by @wilyan09007 in #219).
 
 ### Fixed
+- Apply Codex executable and sandbox aliases consistently across inherited
+  YAML, CLI overrides, training, and eval-only entry points. Codex CLI calls
+  now use explicit sandbox and approval settings instead of the retired
+  `--full-auto` flag (thanks @RohithPariki, #220).
 - Preserve fractional rollout hard scores instead of coercing them to binary
   values (thanks @zixuanguo786-ctrl, #104).
 - Reject duplicate and overlapping IDs while materializing SearchQA manifests
@@ -76,6 +106,8 @@ All notable changes to SkillOpt are documented here. This project adheres to
   @Alphaxalchemy's #129).
 
 ### Tests
+- Add focused OpenCode backend coverage and opt-in real-CLI smoke tests for a
+  plain call and a seeded cycle-level run.
 - Strengthen SkillOpt-Sleep verifier-discipline assertions, including recorded
   scores and gate actions (thanks @Tanmay9223, #96).
 - Add focused coverage for the validation-gate decision core and edit-budget
@@ -85,7 +117,7 @@ All notable changes to SkillOpt are documented here. This project adheres to
 Thank you to the contributors behind this unreleased work:
 @AKhozya, @Alphaxalchemy, @Phoenix0531-sudo, @SparshGarg999,
 @Tanmay9223, @chirag127, @codeL1985, @dimitarvdenev,
-@ichoosetoaccept, @jcforever1, @nankingjing, and
+@ichoosetoaccept, @jcforever1, @nankingjing, @wilyan09007, @xs229, and
 @zixuanguo786-ctrl.
 
 ## [0.2.0] — 2026-07-02
