@@ -1,0 +1,54 @@
+# BIRD Text-to-SQL SkillOpt Configuration
+# Usage: python scripts/train.py --config skillopt/envs/bird_text2sql/config.yaml
+
+_base_: ../../configs/_base_/default.yaml
+
+env: bird_text2sql
+
+model:
+  backend: openai_compatible
+  optimizer: Qwen3.6-27B
+  target: Qwen3.6-27B
+  target_base_url: http://10.142.85.18:31181/v1
+  target_api_key: empty
+
+train:
+  num_epochs: 2
+  batch_size: 10
+
+gradient:
+  minibatch_size: 4
+  failure_only: false
+
+optimizer:
+  learning_rate: 2
+  lr_scheduler: cosine
+  skill_update_mode: patch
+  use_slow_update: true
+  use_meta_skill: true
+  use_skill_aware_reflection: true
+
+evaluation:
+  use_gate: true
+  sel_env_num: 0
+  eval_test: false
+
+env:
+  skill_init: skillopt/envs/bird_text2sql/skills/initial.md
+  split_mode: split_dir
+  # User must fill in these paths:
+  train_prompt_path: ""    # e.g. /path/to/train_prompt.jsonl
+  dev_prompt_path: ""      # e.g. /path/to/dev_prompt.jsonl
+  db_root_path: ""         # e.g. /path/to/dev_databases
+  bird_project_root: ""    # e.g. /path/to/bird-text-to-sql-260820
+  # Model inference config (passed to run_prompt.py):
+  target_base_url: http://10.142.85.18:31181/v1
+  target_api_key: empty
+  target_engine: Qwen3.6-27B
+  target_temperature: 1.0
+  target_max_tokens: 32768
+  target_timeout: 1200
+  target_max_retries: 9
+  target_num_processes: 100
+  target_max_syntax_attempts: 20
+  target_sql_dialect: SQLite

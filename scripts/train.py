@@ -100,6 +100,11 @@ def _register_builtins() -> None:
         _ENV_REGISTRY["swebench"] = SWEBenchAdapter
     except ImportError:
         pass
+    try:
+        from skillopt.envs.bird_text2sql.adapter import BIRDText2SQLAdapter
+        _ENV_REGISTRY["bird_text2sql"] = BIRDText2SQLAdapter
+    except ImportError:
+        pass
 
 
 def get_adapter(cfg: dict):
